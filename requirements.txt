@@ -17,3 +17,9 @@ email-validator>=2.1.1
 twilio>=9.0.0
 gunicorn>=21.2.0
 psycopg2-binary>=2.9.9
+
+# --- Urban Digital Twin (twin/) ---
+h3>=4.1.0
+shapely>=2.0.3
+flask-compress>=1.14
+cachetools>=5.3.3

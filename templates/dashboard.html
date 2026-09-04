@@ -41,6 +41,17 @@
         border-radius: 20px;
     }
 
+    /* The glass fill above sits on top of a MapLibre canvas and greys it out;
+       the twin brings its own dark chrome, so its host card only needs the
+       border and the radius. The generic .card:hover lift elsewhere in this
+       app also drags a live canvas around on mouse-over -- there is no such
+       rule on this page, but the opt-out class name is kept consistent with
+       coordination_dashboard.html so the two read the same. */
+    .card.twin-host-card {
+        background: rgba(15, 23, 42, 0.75) !important;
+        backdrop-filter: none;
+    }
+
     #map {
         height: 450px;
         border-radius: 16px;
@@ -213,6 +224,28 @@
                     </div>
                 </div>
             </div>
+        </div>
+    </div>
+
+    <!-- Urban Digital Twin -->
+    <div class="card mb-5 overflow-hidden twin-host-card">
+        <div class="card-header py-3 bg-transparent d-flex justify-content-between align-items-center flex-wrap gap-2">
+            <div>
+                <h6 class="m-0 fw-bold text-white d-flex align-items-center gap-2">
+                    🌐 Urban Digital Twin
+                    <span class="badge bg-success bg-opacity-25 text-success border border-success border-opacity-25">LIVE</span>
+                </h6>
+                <div class="small text-muted mt-1">
+                    Hyderabad &amp; Bengaluru · H3 risk grid over Esri imagery · OSINT camera coverage from OpenStreetMap
+                </div>
+            </div>
+            <a href="{{ url_for('twin_pages.digital_twin_page') }}" class="btn btn-sm btn-outline-light border-secondary px-3">
+                <i class="fas fa-up-right-and-down-left-from-center me-1"></i>Full screen
+            </a>
+        </div>
+        <div class="card-body p-0">
+            {% set twin_variant = 'compact' %}
+            {% include "partials/twin_console.html" %}
         </div>
     </div>
 

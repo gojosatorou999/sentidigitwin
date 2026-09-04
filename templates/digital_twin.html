@@ -1,0 +1,92 @@
+{% extends "base.html" %}
+
+{% block title %}Urban Digital Twin{% endblock %}
+
+{% block head_extra %}
+<style>
+    .twin-page-wrap {
+        max-width: 96%;
+        margin: 1.5rem auto 2rem;
+    }
+
+    .twin-page-head {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 1rem;
+        margin-bottom: 1.25rem;
+    }
+
+    .twin-page-head h2 {
+        font-weight: 800;
+        margin: 0;
+        letter-spacing: -0.02em;
+    }
+
+    .twin-page-head .subtitle {
+        color: rgba(255, 255, 255, 0.55);
+        font-size: 0.95rem;
+        margin: 0.2rem 0 0;
+    }
+
+    .twin-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 0.72rem;
+        font-weight: 700;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        border-radius: 999px;
+        padding: 4px 12px;
+        border: 1px solid rgba(255, 255, 255, 0.15);
+        background: rgba(255, 255, 255, 0.05);
+        color: rgba(255, 255, 255, 0.75);
+    }
+
+    .twin-chip .dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: #10b981;
+        animation: pulse 2s infinite;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="twin-page-wrap">
+    <div class="twin-page-head">
+        <div>
+            <h2>🌐 Urban Digital Twin</h2>
+            <p class="subtitle">
+                Live H3 hexagonal risk state for Hyderabad and Bengaluru — hydrology,
+                terrain, infrastructure and verified incidents, fused and forecast
+                over live satellite imagery.
+            </p>
+        </div>
+        <div class="d-flex gap-2 flex-wrap align-items-center">
+            <span class="twin-chip"><span class="dot"></span>Live</span>
+            <a href="{{ url_for('analyst_dashboard') }}" class="btn btn-outline-light btn-sm border-secondary">
+                <i class="fas fa-chart-line me-1"></i>Analyst Dashboard
+            </a>
+            <a href="{{ url_for('coordination_dashboard') }}" class="btn btn-primary btn-sm fw-bold">
+                <i class="fas fa-tachometer-alt me-1"></i>Coordination
+            </a>
+        </div>
+    </div>
+
+    {% set twin_variant = 'page' %}
+    {% set twin_autostart = 'now' %}
+    {% include "partials/twin_console.html" %}
+
+    <p class="text-white-50 small mt-3 mb-0">
+        Click any hexagon for its sub-scores, the assets and verified reports inside it,
+        the surveillance cameras covering it, and street-level imagery of the location.
+        Basemaps: Esri World Imagery · OpenFreeMap · NASA GIBS.
+        Street imagery: KartaView / Mapillary contributors.
+        Camera OSINT: © OpenStreetMap contributors (ODbL) via Overpass.
+    </p>
+</div>
+{% endblock %}

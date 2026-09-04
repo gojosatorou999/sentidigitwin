@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+instance/
+*.db
+*.sqlite3
+.env
+
+# Ingest TTL cache is derived data (section 9); boundaries ARE committed.
+data/twin/cache/

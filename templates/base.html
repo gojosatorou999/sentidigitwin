@@ -998,6 +998,11 @@
                                 </a>
                             </li>
                             <li>
+                                <a class="dropdown-item" href="{{ url_for('twin_pages.digital_twin_page') }}">
+                                    <i class="fas fa-earth-asia me-2 text-info"></i>Urban Digital Twin
+                                </a>
+                            </li>
+                            <li>
                                 <a class="dropdown-item" href="{{ url_for('simulation') }}">
                                     <i class="fas fa-microchip me-2 text-info"></i>{{ translate('risk_simulator') }}
                                 </a>
@@ -1032,6 +1037,19 @@
                                 </a>
                             </li>
                         </ul>
+                    </li>
+                    {% endif %}
+
+                    {# The Tools dropdown above is official/analyst-only, and
+                       every entry in it redirects an admin away. The twin does
+                       not -- twin/security.py admits `admin` alongside those
+                       two -- so admins get their own way in rather than a link
+                       they would bounce off. #}
+                    {% if current_user.is_authenticated and current_user.role == 'admin' %}
+                    <li class="nav-item">
+                        <a class="nav-link" href="{{ url_for('twin_pages.digital_twin_page') }}">
+                            <i class="fas fa-earth-asia me-1 text-info"></i>Urban Digital Twin
+                        </a>
                     </li>
                     {% endif %}
 
@@ -1201,6 +1219,11 @@
                             <li>
                                 <a class="dropdown-item" href="{{ url_for('analyst_dashboard') }}">
                                     <i class="fas fa-chart-line me-2"></i>Analyst Dashboard
+                                </a>
+                            </li>
+                            <li>
+                                <a class="dropdown-item" href="{{ url_for('twin_pages.digital_twin_page') }}">
+                                    <i class="fas fa-earth-asia me-2"></i>Urban Digital Twin
                                 </a>
                             </li>
                             <li>

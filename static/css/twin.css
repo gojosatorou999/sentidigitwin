@@ -1,0 +1,1053 @@
+/* ==========================================================================
+   Urban Digital Twin console.
+
+   Styled onto Sentinel AI's own design language rather than the module's
+   original standalone palette: Outfit (loaded once by base.html), the app's
+   slate/sky palette, and the same chrome the analyst dashboard's flood-map
+   cards use -- #151b2b header bars over #1a2234 bodies, 1px white-10%
+   borders, 12px radii, and #1e2a3a popups.
+
+   Layout note (the reason most of this file changed): every readout used to
+   float over the map. A half-width pane carried a search box, a layer panel,
+   a KPI card, a legend card, a hover tooltip and three MapLibre control
+   groups on top of the canvas at once. Search and the zone picker now live
+   in the pane header; the KPI and legend live in a docked strip below the
+   map; only the layer panel still floats, and only while it is open.
+
+   Everything is scoped under .twin-console so the console can be dropped
+   into an existing Bootstrap page without leaking a single rule outward --
+   the one exception is the MapLibre control/popup theming, which has to
+   reach .maplibregl-* nodes MapLibre injects itself, and is therefore still
+   written as a descendant of .twin-console.
+   ========================================================================== */
+
+.twin-console {
+  --twin-bg: #0b1220;
+  --twin-chrome: #151b2b;
+  --twin-panel: rgba(255, 255, 255, 0.05);
+  --twin-panel-solid: #1a2234;
+  --twin-border: rgba(255, 255, 255, 0.1);
+  --twin-border-strong: rgba(255, 255, 255, 0.18);
+  --twin-text: #f8fafc;
+  --twin-text-dim: rgba(255, 255, 255, 0.55);
+  --twin-accent: #38d9ff;
+  --twin-accent-deep: #0ea5e9;
+  --twin-normal: #22c55e;
+  --twin-watch: #eab308;
+  --twin-warning: #f97316;
+  --twin-critical: #ef4444;
+
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  background: var(--twin-bg);
+  color: var(--twin-text);
+  font-family: 'Outfit', -apple-system, 'Segoe UI', Roboto, sans-serif;
+  overflow: hidden;
+  border-radius: 12px;
+  border: 1px solid var(--twin-border);
+}
+
+/* Embedded in a dashboard card, standing alone as its own page, or sharing
+   the fold with other panels. */
+.twin-console--embedded { height: 74vh; min-height: 560px; }
+.twin-console--compact { height: 58vh; min-height: 440px; }
+.twin-console--page {
+  height: calc(100vh - 190px);
+  min-height: 620px;
+  border-radius: 16px;
+}
+
+.twin-console *,
+.twin-console *::before,
+.twin-console *::after { box-sizing: border-box; }
+
+/* ---- Header ------------------------------------------------------------ */
+
+.twin-header {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 8px 14px;
+  background: var(--twin-chrome);
+  border-bottom: 1px solid var(--twin-border);
+  flex-wrap: wrap;
+  flex: 0 0 auto;
+}
+
+.twin-header-cluster {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.twin-header-cluster--icons { gap: 6px; }
+.twin-header-cluster--end { margin-left: auto; gap: 10px; }
+
+.twin-header-label {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--twin-text-dim);
+}
+
+/* Horizon pills, joined into one control so they read as four states of a
+   single setting rather than four unrelated buttons. */
+.twin-segmented {
+  display: inline-flex;
+  border: 1px solid var(--twin-border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.twin-horizon-btn {
+  background: transparent;
+  border: none;
+  border-right: 1px solid var(--twin-border);
+  color: var(--twin-text-dim);
+  padding: 4px 12px;
+  cursor: pointer;
+  font-size: 12.5px;
+  font-weight: 500;
+  font-family: inherit;
+  transition: background 0.18s ease, color 0.18s ease;
+  white-space: nowrap;
+}
+
+.twin-horizon-btn:last-child { border-right: none; }
+.twin-horizon-btn:hover { background: rgba(255, 255, 255, 0.07); color: var(--twin-text); }
+
+.twin-horizon-btn.active {
+  background: rgba(56, 217, 255, 0.16);
+  color: var(--twin-accent);
+  font-weight: 600;
+}
+
+.twin-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--twin-border);
+  color: var(--twin-text-dim);
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 12.5px;
+  font-family: inherit;
+  transition: all 0.18s ease;
+}
+
+.twin-icon-btn:hover { background: rgba(255, 255, 255, 0.1); color: var(--twin-text); }
+.twin-icon-btn:disabled { opacity: 0.5; cursor: default; }
+
+.twin-icon-btn.on {
+  color: var(--twin-accent);
+  border-color: rgba(56, 217, 255, 0.45);
+  background: rgba(56, 217, 255, 0.12);
+}
+
+.twin-select,
+.twin-console input[type="date"].twin-select {
+  background: rgba(11, 18, 32, 0.9);
+  color: var(--twin-text);
+  border: 1px solid var(--twin-border);
+  border-radius: 8px;
+  padding: 4px 8px;
+  font-size: 12.5px;
+  font-family: inherit;
+  outline: none;
+  max-width: 170px;
+}
+
+.twin-select:focus { border-color: var(--twin-accent); }
+.twin-select option { background: #0f172a; color: var(--twin-text); }
+.twin-select--date { max-width: 140px; }
+
+.twin-health-pill {
+  display: flex;
+  gap: 5px;
+  align-items: center;
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--twin-border);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.twin-health-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #475569;
+}
+
+.twin-health-dot.ok { background: var(--twin-normal); }
+.twin-health-dot.degraded { background: var(--twin-watch); }
+.twin-health-dot.failed { background: var(--twin-critical); }
+
+.twin-clock {
+  font-variant-numeric: tabular-nums;
+  color: var(--twin-text-dim);
+  font-size: 11.5px;
+  font-weight: 500;
+}
+
+/* ---- Panes ------------------------------------------------------------- */
+
+.twin-panes {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.twin-pane {
+  flex: 1 1 0;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  border-right: 1px solid var(--twin-border);
+  position: relative;
+}
+
+.twin-pane:last-child { border-right: none; }
+
+.twin-pane-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 10px;
+  background: rgba(21, 27, 43, 0.85);
+  border-bottom: 1px solid var(--twin-border);
+  flex: 0 0 auto;
+}
+
+.twin-pane-title {
+  font-weight: 700;
+  font-size: 12.5px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  white-space: nowrap;
+}
+
+.twin-pane-title .stream-badge {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--twin-border);
+  color: var(--twin-text-dim);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.twin-pane-title .stream-badge.live {
+  color: #4ade80;
+  border-color: rgba(74, 222, 128, 0.4);
+  background: rgba(74, 222, 128, 0.1);
+}
+
+.twin-pane-title .stream-badge.polling {
+  color: #7dd3fc;
+  border-color: rgba(125, 211, 252, 0.35);
+  background: rgba(125, 211, 252, 0.08);
+}
+
+.twin-pane-title .stream-badge.degraded {
+  color: #fbbf24;
+  border-color: rgba(251, 191, 36, 0.4);
+  background: rgba(251, 191, 36, 0.1);
+}
+
+.twin-pane-tools {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.twin-map-container {
+  flex: 1 1 auto;
+  position: relative;
+  min-height: 200px;
+  background: #0b1220;
+  overflow: hidden;
+}
+
+.twin-map-container .maplibregl-map { width: 100%; height: 100%; }
+
+/* ---- MapLibre native chrome, themed to match --------------------------- */
+
+.twin-console .maplibregl-ctrl-bottom-right { bottom: 6px; right: 6px; }
+
+.twin-console .maplibregl-ctrl-group {
+  background: rgba(15, 23, 42, 0.92) !important;
+  border: 1px solid var(--twin-border) !important;
+  border-radius: 8px !important;
+  overflow: hidden;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.4) !important;
+}
+
+.twin-console .maplibregl-ctrl-group button {
+  background: transparent !important;
+  width: 28px !important;
+  height: 28px !important;
+}
+
+.twin-console .maplibregl-ctrl-group button + button {
+  border-top: 1px solid var(--twin-border) !important;
+}
+
+.twin-console .maplibregl-ctrl-group button:hover {
+  background: rgba(56, 217, 255, 0.25) !important;
+}
+
+.twin-console .maplibregl-ctrl-icon { filter: invert(1) brightness(1.4); }
+
+.twin-console .maplibregl-ctrl-attrib {
+  background: rgba(11, 18, 32, 0.7) !important;
+  color: var(--twin-text-dim) !important;
+  border-radius: 6px;
+  font-size: 10px;
+}
+
+.twin-console .maplibregl-ctrl-attrib a { color: var(--twin-text-dim) !important; }
+
+/* Popups match the flood-map popups on the analyst dashboard exactly. */
+.twin-console .maplibregl-popup-content {
+  background: #1e2a3a;
+  color: var(--twin-text);
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+  padding: 11px 14px;
+  font-size: 12.5px;
+  font-family: inherit;
+}
+
+.twin-console .maplibregl-popup-tip { border-top-color: #1e2a3a !important; }
+.twin-console .maplibregl-popup-close-button { color: #94a3b8; font-size: 15px; }
+
+.twin-popup-title {
+  font-weight: 700;
+  font-size: 13px;
+  margin-bottom: 7px;
+  padding-right: 12px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+
+.twin-popup-kind {
+  font-size: 9.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--twin-accent);
+  border: 1px solid rgba(56, 217, 255, 0.35);
+  background: rgba(56, 217, 255, 0.1);
+  border-radius: 999px;
+  padding: 1px 7px;
+}
+
+.twin-popup-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 2px 0;
+  color: var(--twin-text-dim);
+}
+
+.twin-popup-row b { color: var(--twin-text); font-weight: 600; text-align: right; }
+
+.twin-popup-links { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+
+.twin-popup-links a {
+  font-size: 11.5px;
+  text-decoration: none;
+  color: var(--twin-accent);
+  border: 1px solid rgba(56, 217, 255, 0.35);
+  border-radius: 999px;
+  padding: 2px 10px;
+}
+
+.twin-popup-links a:hover { background: rgba(56, 217, 255, 0.15); }
+.twin-popup-attrib { margin-top: 7px; font-size: 9.5px; color: rgba(255, 255, 255, 0.4); }
+
+/* ---- Address search (in the pane header, not over the map) ------------- */
+
+.twin-search {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: rgba(11, 18, 32, 0.9);
+  border: 1px solid var(--twin-border);
+  border-radius: 999px;
+  padding: 3px 11px;
+  min-width: 0;
+  flex: 1 1 150px;
+  max-width: 230px;
+}
+
+.twin-search i { font-size: 10.5px; color: var(--twin-text-dim); flex: 0 0 auto; }
+.twin-search:focus-within { border-color: var(--twin-accent); }
+
+.twin-search-input {
+  width: 100%;
+  min-width: 0;
+  background: transparent;
+  border: none;
+  font-size: 12.5px;
+  font-family: inherit;
+  color: var(--twin-text);
+  outline: none;
+  padding: 1px 0;
+}
+
+.twin-search-input::placeholder { color: var(--twin-text-dim); }
+
+.twin-search-results {
+  position: absolute;
+  top: calc(100% + 5px);
+  left: 0;
+  right: 0;
+  min-width: 240px;
+  background: rgba(15, 23, 42, 0.98);
+  border: 1px solid var(--twin-border);
+  border-radius: 10px;
+  overflow: hidden;
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.5);
+  display: none;
+  z-index: 30;
+}
+
+.twin-search-results.open { display: block; }
+
+.twin-search-result {
+  padding: 7px 11px;
+  font-size: 12px;
+  color: var(--twin-text);
+  cursor: pointer;
+  border-bottom: 1px solid var(--twin-border);
+}
+
+.twin-search-result:last-child { border-bottom: none; }
+.twin-search-result:hover { background: rgba(56, 217, 255, 0.16); }
+.twin-search-result .muted { color: var(--twin-text-dim); font-size: 10.5px; }
+
+/* ---- Layer panel (the only thing still floating over the canvas) -------- */
+
+.twin-map-tools {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  z-index: 6;
+}
+
+.twin-layer-toggle-btn {
+  background: rgba(15, 23, 42, 0.94);
+  width: 30px;
+  height: 30px;
+  font-size: 13px;
+}
+
+.twin-layer-panel {
+  position: absolute;
+  top: 36px;
+  left: 0;
+  background: rgba(15, 23, 42, 0.97);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  border: 1px solid var(--twin-border);
+  border-radius: 10px;
+  padding: 8px 10px;
+  font-size: 12px;
+  display: none;
+  min-width: 178px;
+  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.5);
+}
+
+.twin-layer-panel.open { display: block; }
+
+.twin-layer-group + .twin-layer-group {
+  margin-top: 7px;
+  padding-top: 7px;
+  border-top: 1px solid var(--twin-border);
+}
+
+.twin-layer-group-label {
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--twin-text-dim);
+  margin-bottom: 3px;
+}
+
+.twin-layer-panel label {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 2px 0;
+  cursor: pointer;
+  margin: 0;
+  color: var(--twin-text);
+}
+
+.twin-layer-panel input[type="checkbox"] { accent-color: var(--twin-accent-deep); }
+.twin-layer-panel input[type="checkbox"]:disabled + * { opacity: 0.5; }
+
+/* ---- Docked KPI + legend strip ----------------------------------------- */
+
+.twin-pane-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 5px 10px;
+  background: rgba(21, 27, 43, 0.9);
+  border-top: 1px solid var(--twin-border);
+  flex: 0 0 auto;
+  min-height: 32px;
+  overflow-x: auto;
+}
+
+.twin-kpi {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.twin-kpi-stat { color: var(--twin-text-dim); }
+.twin-kpi-stat b { color: var(--twin-text); font-weight: 600; margin-left: 2px; }
+
+.twin-kpi-sep {
+  width: 1px;
+  height: 13px;
+  background: var(--twin-border);
+  display: inline-block;
+}
+
+.twin-badge {
+  border-radius: 5px;
+  padding: 0 7px;
+  font-size: 11px;
+  font-weight: 700;
+  color: #0b1220;
+  line-height: 17px;
+}
+
+.twin-badge-critical { background: var(--twin-critical); color: #fff; }
+.twin-badge-warning { background: var(--twin-warning); }
+.twin-badge-watch { background: var(--twin-watch); }
+.twin-badge-normal { background: var(--twin-normal); color: #06240f; }
+
+/* The five-row legend card is now a 96px ribbon: the bands are ordered and
+   continuous, so a gradient with hard stops says everything the rows did. */
+.twin-legend {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 132px;
+  flex: 0 0 auto;
+}
+
+.twin-legend-bar {
+  height: 6px;
+  border-radius: 3px;
+  background: linear-gradient(90deg,
+    #22c55e 0 25%, #eab308 25% 50%, #f97316 50% 75%, #ef4444 75% 100%);
+}
+
+.twin-legend-ticks {
+  display: flex;
+  justify-content: space-between;
+  font-size: 8.5px;
+  color: var(--twin-text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.twin-legend-ticks i { font-style: normal; }
+
+/* ---- Comparison strip -------------------------------------------------- */
+
+.twin-comparison {
+  display: flex;
+  gap: 20px;
+  padding: 7px 14px;
+  background: var(--twin-chrome);
+  border-top: 1px solid var(--twin-border);
+  font-size: 12px;
+  overflow-x: auto;
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.twin-comparison-item { color: var(--twin-text-dim); }
+.twin-comparison-item b { color: var(--twin-text); font-weight: 600; }
+.twin-comparison-item .city { color: var(--twin-accent); text-transform: uppercase;
+  font-size: 10.5px; letter-spacing: 0.08em; font-weight: 700; margin-right: 4px; }
+
+/* ---- Drill-down drawer -------------------------------------------------- */
+
+.twin-drawer {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  max-height: 72%;
+  background: rgba(11, 18, 32, 0.97);
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+  border-top: 1px solid var(--twin-border-strong);
+  transform: translateY(101%);
+  transition: transform 240ms cubic-bezier(0.4, 0, 0.2, 1);
+  z-index: 40;
+  overflow-y: auto;
+  padding: 14px 18px 18px;
+}
+
+.twin-drawer.open { transform: translateY(0); }
+
+.twin-drawer-close {
+  position: absolute;
+  top: 8px;
+  right: 14px;
+  background: transparent;
+  border: none;
+  color: var(--twin-text-dim);
+  font-size: 21px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.twin-drawer-close:hover { color: var(--twin-text); }
+
+.twin-drawer-title {
+  font-size: 15px;
+  font-weight: 700;
+  margin-bottom: 6px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding-right: 30px;
+}
+
+.twin-drawer-title .h3-index {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  color: var(--twin-text-dim);
+  font-weight: 500;
+}
+
+.status-tag {
+  font-size: 10.5px;
+  padding: 2px 10px;
+  border-radius: 999px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--twin-border);
+}
+
+.status-tag.normal { background: rgba(34, 197, 94, 0.18); color: #4ade80; border-color: rgba(34,197,94,.4); }
+.status-tag.watch { background: rgba(234, 179, 8, 0.18); color: #facc15; border-color: rgba(234,179,8,.4); }
+.status-tag.warning { background: rgba(249, 115, 22, 0.18); color: #fb923c; border-color: rgba(249,115,22,.4); }
+.status-tag.critical { background: rgba(239, 68, 68, 0.2); color: #f87171; border-color: rgba(239,68,68,.45); }
+
+.twin-subscore-row {
+  display: flex;
+  gap: 7px;
+  flex-wrap: wrap;
+  margin: 10px 0;
+  font-size: 11.5px;
+}
+
+.twin-subscore {
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--twin-border);
+  border-radius: 8px;
+  padding: 5px 11px;
+  color: var(--twin-text-dim);
+}
+
+.twin-subscore b { color: var(--twin-text); font-size: 13px; margin-left: 4px; }
+
+.twin-explanation {
+  font-size: 13.5px;
+  line-height: 1.6;
+  margin: 9px 0;
+  color: var(--twin-text);
+}
+
+.twin-drawer-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 18px;
+  margin-top: 8px;
+}
+
+.twin-drawer-section-title {
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 700;
+  color: var(--twin-text-dim);
+  margin: 12px 0 6px;
+}
+
+.twin-asset-chip,
+.twin-report-card {
+  display: inline-block;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--twin-border);
+  border-radius: 7px;
+  padding: 3px 9px;
+  font-size: 11.5px;
+  margin: 2px 5px 2px 0;
+}
+
+.twin-report-card { border-color: rgba(239, 68, 68, 0.35); }
+
+.twin-muted { color: var(--twin-text-dim); font-size: 11.5px; }
+
+.twin-actions { display: flex; gap: 9px; margin-top: 14px; flex-wrap: wrap; }
+
+.twin-action-btn {
+  background: var(--twin-accent-deep);
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  padding: 7px 16px;
+  font-size: 12.5px;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.twin-action-btn:hover { filter: brightness(1.12); }
+.twin-action-btn.danger { background: var(--twin-critical); }
+.twin-action-btn.secondary {
+  background: transparent;
+  border: 1px solid var(--twin-border-strong);
+  color: var(--twin-text);
+}
+.twin-action-btn.secondary:hover { background: rgba(255, 255, 255, 0.08); }
+
+/* ---- Ground-truth panel: imagery + OSINT cameras ------------------------ */
+
+.twin-street {
+  margin-top: 6px;
+  border: 1px solid var(--twin-border);
+  border-radius: 12px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.twin-street-head,
+.twin-cctv-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--twin-border);
+  flex-wrap: wrap;
+}
+
+.twin-street-head .title,
+.twin-cctv-head .title {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--twin-text-dim);
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.twin-street-provider,
+.twin-cctv-source {
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  border-radius: 999px;
+  padding: 1px 8px;
+  background: rgba(34, 197, 94, 0.15);
+  color: #4ade80;
+  border: 1px solid rgba(34, 197, 94, 0.35);
+  text-transform: uppercase;
+}
+
+.twin-cctv-source {
+  background: rgba(56, 217, 255, 0.12);
+  color: var(--twin-accent);
+  border-color: rgba(56, 217, 255, 0.35);
+}
+
+.twin-street-provider.live {
+  background: rgba(239, 68, 68, 0.15);
+  color: #f87171;
+  border-color: rgba(239, 68, 68, 0.35);
+}
+
+.twin-street-body {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+  gap: 10px;
+  padding: 10px 12px;
+}
+
+.twin-street-stage {
+  position: relative;
+  border-radius: 9px;
+  overflow: hidden;
+  background: #060b16;
+  min-height: 200px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.twin-street-stage img {
+  width: 100%;
+  height: 100%;
+  max-height: 280px;
+  object-fit: cover;
+  display: block;
+}
+
+.twin-street-caption {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 6px 10px;
+  font-size: 10.5px;
+  color: #e2e8f0;
+  background: linear-gradient(to top, rgba(2, 6, 16, 0.92), rgba(2, 6, 16, 0));
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.twin-street-thumbs {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 280px;
+  overflow-y: auto;
+}
+
+.twin-street-thumb {
+  border: 1px solid var(--twin-border);
+  border-radius: 7px;
+  overflow: hidden;
+  cursor: pointer;
+  position: relative;
+  flex: 0 0 auto;
+  background: #060b16;
+  padding: 0;
+}
+
+.twin-street-thumb img { width: 100%; height: 60px; object-fit: cover; display: block; }
+.twin-street-thumb.active { border-color: var(--twin-accent); box-shadow: 0 0 0 1px var(--twin-accent); }
+
+.twin-street-thumb .dist {
+  position: absolute;
+  right: 3px;
+  bottom: 3px;
+  font-size: 9px;
+  background: rgba(2, 6, 16, 0.8);
+  border-radius: 4px;
+  padding: 1px 4px;
+  color: #cbd5e1;
+}
+
+.twin-street-empty {
+  grid-column: 1 / -1;
+  padding: 16px 12px;
+  text-align: center;
+  color: var(--twin-text-dim);
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
+.twin-cctv { border-top: 1px solid var(--twin-border); }
+.twin-cctv-head { border-bottom: none; padding-bottom: 2px; }
+
+.twin-cctv-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 4px 12px 10px;
+}
+
+.twin-cctv-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  text-decoration: none;
+  color: var(--twin-text);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--twin-border);
+  border-left: 2px solid var(--twin-accent);
+  border-radius: 7px;
+  padding: 3px 9px;
+  max-width: 100%;
+}
+
+.twin-cctv-chip:hover { background: rgba(255, 255, 255, 0.1); color: #fff; }
+.twin-cctv-chip i { font-size: 10px; color: var(--twin-text-dim); }
+.twin-cctv-chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.twin-cctv-chip em { font-style: normal; font-size: 10px; color: var(--twin-text-dim); }
+
+.twin-cctv-chip .feed {
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #f87171;
+  border: 1px solid rgba(239, 68, 68, 0.4);
+  background: rgba(239, 68, 68, 0.12);
+  border-radius: 4px;
+  padding: 0 4px;
+}
+
+/* Camera kinds, matching CCTV_KIND_COLOUR in twin-layers.js. */
+.twin-cctv-chip.kind-traffic { border-left-color: #38bdf8; }
+.twin-cctv-chip.kind-public { border-left-color: #a78bfa; }
+.twin-cctv-chip.kind-outdoor { border-left-color: #22d3ee; }
+.twin-cctv-chip.kind-indoor { border-left-color: #94a3b8; }
+.twin-cctv-chip.kind-private { border-left-color: #64748b; }
+
+.twin-street-links {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 0 12px 10px;
+}
+
+.twin-street-links a {
+  font-size: 11.5px;
+  text-decoration: none;
+  border: 1px solid var(--twin-border-strong);
+  border-radius: 999px;
+  padding: 3px 11px;
+  color: var(--twin-text);
+  transition: all 0.2s ease;
+}
+
+.twin-street-links a:hover { background: rgba(255, 255, 255, 0.09); color: #fff; }
+
+/* ---- Hover tooltip (positioned at the cursor by twin-console.js) -------- */
+
+.twin-tooltip {
+  position: absolute;
+  pointer-events: none;
+  background: #1e2a3a;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 8px;
+  padding: 7px 10px;
+  font-size: 11.5px;
+  line-height: 1.5;
+  z-index: 20;
+  width: 180px;
+  display: none;
+  top: 0;
+  left: 0;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.5);
+}
+
+.twin-tooltip.visible { display: block; }
+.twin-tooltip .degraded-note { color: var(--twin-watch); margin-top: 3px; font-size: 10.5px; }
+.twin-tooltip .status-normal { color: #4ade80; }
+.twin-tooltip .status-watch { color: #facc15; }
+.twin-tooltip .status-warning { color: #fb923c; }
+.twin-tooltip .status-critical { color: #f87171; }
+
+/* ---- Boot / error states ------------------------------------------------ */
+
+.twin-boot {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 12px;
+  color: var(--twin-text-dim);
+  font-size: 13.5px;
+  text-align: center;
+  padding: 30px;
+}
+
+.twin-boot .spinner {
+  width: 24px;
+  height: 24px;
+  border: 3px solid rgba(255, 255, 255, 0.15);
+  border-top-color: var(--twin-accent);
+  border-radius: 50%;
+  animation: twin-spin 0.9s linear infinite;
+}
+
+@keyframes twin-spin { to { transform: rotate(360deg); } }
+
+.twin-toast {
+  position: absolute;
+  top: 54px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 60;
+  background: rgba(15, 23, 42, 0.97);
+  border: 1px solid rgba(56, 217, 255, 0.5);
+  border-radius: 999px;
+  padding: 7px 16px;
+  font-size: 12.5px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.3s ease;
+  max-width: 90%;
+  text-align: center;
+}
+
+.twin-toast.show { opacity: 1; }
+
+/* ---- Responsive --------------------------------------------------------- */
+
+@media (max-width: 1200px) {
+  .twin-pane-header { flex-wrap: wrap; }
+  .twin-search { max-width: none; }
+}
+
+@media (max-width: 992px) {
+  .twin-panes { flex-direction: column; }
+  .twin-pane { border-right: none; border-bottom: 1px solid var(--twin-border); }
+  .twin-console--embedded,
+  .twin-console--compact { height: auto; min-height: 0; }
+  .twin-console--embedded .twin-map-container,
+  .twin-console--compact .twin-map-container { min-height: 340px; }
+  .twin-drawer { max-height: 82%; }
+  .twin-drawer-grid { grid-template-columns: 1fr; }
+  .twin-street-body { grid-template-columns: 1fr; }
+  .twin-street-thumbs { flex-direction: row; max-height: none; overflow-x: auto; }
+  .twin-street-thumb { width: 96px; }
+  .twin-header-cluster--end { margin-left: 0; }
+}

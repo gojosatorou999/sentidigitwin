@@ -1,0 +1,185 @@
+{#
+  Urban Digital Twin console -- an embeddable shell.
+
+  Include it anywhere an official/analyst/admin page wants the twin:
+
+      {% include "partials/twin_console.html" %}
+
+  Optionally set `twin_variant` to "page" first (the standalone /digital-twin
+  route does) to get the full-height layout instead of the card-height one,
+  or "compact" for a dashboard card that has to share the fold with other
+  panels.
+
+  There is deliberately no Jinja loop over cities here. The city list, its
+  zones and its camera settings all come from GET /api/twin/cities at runtime,
+  so this same partial drops into analyst_dashboard.html, dashboard.html and
+  coordination_dashboard.html without any view function having to grow a
+  single new template variable.
+#}
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/twin.css') }}">
+
+<script>
+  // MapLibre is often already on the page -- analyst_dashboard.html loads it
+  // in <head> for its own flood maps. Loading a second copy replaces
+  // window.maplibregl mid-page, which silently detaches every map already
+  // built from the library that built it (and, when the versions differ,
+  // hands the twin an API it was not written against). Inject it only when
+  // it is genuinely absent, and give twin-console.js one promise to await
+  // either way.
+  window.TwinMapLibreReady = window.TwinMapLibreReady || new Promise(function (resolve, reject) {
+    if (window.maplibregl) { resolve(window.maplibregl); return; }
+    var script = document.createElement("script");
+    script.src = "https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js";
+    script.onload = function () { resolve(window.maplibregl); };
+    script.onerror = function () { reject(new Error("MapLibre GL could not be loaded")); };
+    document.head.appendChild(script);
+  });
+</script>
+
+<div class="twin-console twin-console--{{ twin_variant | default('embedded') }}"
+     id="twinConsole"
+     data-twin-console
+     data-autostart="{{ twin_autostart | default('visible') }}">
+
+  <div class="twin-header">
+    <div class="twin-header-cluster">
+      <span class="twin-header-label">Horizon</span>
+      <div class="twin-segmented" data-twin-horizons>
+        <button type="button" class="twin-horizon-btn active" data-horizon="0">Now</button>
+        <button type="button" class="twin-horizon-btn" data-horizon="3">+3h</button>
+        <button type="button" class="twin-horizon-btn" data-horizon="6">+6h</button>
+        <button type="button" class="twin-horizon-btn" data-horizon="24">+24h</button>
+      </div>
+    </div>
+
+    <div class="twin-header-cluster">
+      <select class="twin-select" data-twin-basemap title="Basemap">
+        <option value="satellite" selected>Satellite</option>
+        <option value="vector">Street map</option>
+        <option value="gibs">NASA GIBS</option>
+      </select>
+      <input type="date" class="twin-select twin-select--date" data-twin-gibs-date
+             style="display:none" title="NASA GIBS imagery date">
+    </div>
+
+    {# Icon-only: three labelled pill buttons across the top of a half-width
+       pane was most of the header's width for two actions used once a
+       session. Titles carry the meaning; aria-labels carry it to a reader. #}
+    <div class="twin-header-cluster twin-header-cluster--icons">
+      <button type="button" class="twin-icon-btn" data-twin-camera-link
+              title="Link both maps so they pan and zoom together"
+              aria-label="Link map cameras">
+        <i class="fas fa-link"></i>
+      </button>
+      <button type="button" class="twin-icon-btn" data-twin-refresh
+              title="Recompute city state now" aria-label="Recompute city state">
+        <i class="fas fa-rotate"></i>
+      </button>
+    </div>
+
+    <div class="twin-header-cluster twin-header-cluster--end">
+      <div class="twin-health-pill" data-twin-health title="Live source health">
+        <span class="twin-header-label">Health</span>
+      </div>
+      <span class="twin-clock" data-twin-clock>--:--:--</span>
+    </div>
+  </div>
+
+  <div class="twin-panes" data-twin-panes>
+    <div class="twin-boot" data-twin-boot>
+      <div class="spinner"></div>
+      <div>Bringing the digital twin online&hellip;</div>
+    </div>
+  </div>
+
+  <div class="twin-comparison" data-twin-comparison>
+    <span class="twin-comparison-item">Loading city comparison&hellip;</span>
+  </div>
+
+  {# ---- Drill-down drawer: opened by clicking any hexagon ---- #}
+  <div class="twin-drawer" data-twin-drawer>
+    <button type="button" class="twin-drawer-close" data-twin-drawer-close aria-label="Close">&times;</button>
+
+    <div class="twin-drawer-title">
+      <span data-twin-drawer-city></span>
+      <span class="h3-index" data-twin-drawer-h3></span>
+      <span data-twin-drawer-zone class="twin-muted"></span>
+      <span class="status-tag" data-twin-drawer-status></span>
+    </div>
+
+    <div class="twin-subscore-row" data-twin-drawer-subscores></div>
+    <div class="twin-explanation" data-twin-drawer-explanation></div>
+
+    {# ---- Ground truth: open street-level imagery + OSINT cameras ---- #}
+    <div class="twin-street" data-twin-street>
+      <div class="twin-street-head">
+        <span class="title">
+          <i class="fas fa-street-view"></i> Ground truth
+          <span class="twin-street-provider" data-twin-street-provider>checking&hellip;</span>
+        </span>
+        <span class="twin-muted" data-twin-street-note></span>
+      </div>
+      <div class="twin-street-body" data-twin-street-body>
+        <div class="twin-street-empty">Select a cell to load imagery.</div>
+      </div>
+
+      {# OSINT camera list for this cell -- OpenStreetMap surveillance tags,
+         keyless, so it works with no provider token configured at all. #}
+      <div class="twin-cctv" data-twin-cctv>
+        <div class="twin-cctv-head">
+          <span class="title"><i class="fas fa-video"></i> CCTV &amp; surveillance
+            <span class="twin-cctv-source">OSINT · OpenStreetMap</span></span>
+          <span class="twin-muted" data-twin-cctv-count></span>
+        </div>
+        <div class="twin-cctv-list" data-twin-cctv-list>
+          <span class="twin-muted">&mdash;</span>
+        </div>
+      </div>
+
+      <div class="twin-street-links" data-twin-street-links></div>
+    </div>
+
+    <div class="twin-drawer-grid">
+      <div>
+        <div class="twin-drawer-section-title">Critical assets in cell</div>
+        <div data-twin-drawer-assets class="twin-muted">&mdash;</div>
+      </div>
+      <div>
+        <div class="twin-drawer-section-title" data-twin-reports-title>Verified reports (72h)</div>
+        <div data-twin-drawer-reports class="twin-muted">&mdash;</div>
+      </div>
+    </div>
+
+    <div class="twin-actions">
+      <button type="button" class="twin-action-btn danger" data-twin-action="declare-emergency">
+        <i class="fas fa-circle-exclamation"></i> Declare Emergency
+      </button>
+      <button type="button" class="twin-action-btn" data-twin-action="dispatch-volunteer">
+        <i class="fas fa-people-group"></i> Dispatch Volunteers
+      </button>
+      <button type="button" class="twin-action-btn secondary" data-twin-action="broadcast-alert">
+        <i class="fas fa-tower-broadcast"></i> Broadcast Alert
+      </button>
+    </div>
+  </div>
+
+  <div class="twin-toast" data-twin-toast></div>
+</div>
+
+<script>
+  // The drill-down's action buttons drive the coordination routes this app
+  // already owns, rather than anything the twin module invents. Each entry
+  // names the interaction as well as the URL, because they genuinely differ:
+  // declaring an emergency hands the operator a prefilled form to confirm,
+  // while a broadcast is a direct JSON POST.
+  window.TWIN_COORDINATION_ENDPOINTS = {
+    "declare-emergency": { url: "{{ url_for('new_emergency') }}", mode: "form" },
+    "dispatch-volunteer": { url: "{{ url_for('get_volunteers_near_point') }}", mode: "volunteers" },
+    "broadcast-alert": { url: "{{ url_for('send_global_alert') }}", mode: "broadcast" }
+  };
+</script>
+<script src="{{ url_for('static', filename='js/twin-layers.js') }}"></script>
+<script src="{{ url_for('static', filename='js/twin-stream.js') }}"></script>
+<script src="{{ url_for('static', filename='js/digital-twin.js') }}"></script>
+<script src="{{ url_for('static', filename='js/twin-console.js') }}"></script>

@@ -1,0 +1,14 @@
+# Digital twin module dependencies (DIGITAL_TWIN_README.md section 10).
+# Append to the host project's requirements.txt; numpy/requests are already
+# present in Sentinel AI and are listed here only to pin a floor.
+
+h3>=4.1.0
+shapely>=2.0.3
+flask-compress>=1.14
+cachetools>=5.3.3
+numpy>=1.26
+requests>=2.31
+python-dotenv>=1.0
+
+# Dev/test only
+pytest>=8.0

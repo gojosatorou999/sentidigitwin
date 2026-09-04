@@ -3,7 +3,15 @@
 {% block title %}Analyst Dashboard{% endblock %}
 
 {% block head_extra %}
-<link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet" />
+<!-- MapLibre is loaded here, in <head>, rather than at the end of <body>:
+     the Urban Digital Twin partial further down injects its own copy only
+     when window.maplibregl is absent, and a second copy loading afterwards
+     would replace the library out from under every map already built on
+     it. 4.7.1 is the version the twin console targets; the flood maps
+     below use Map/Marker/Popup/NavigationControl/AttributionControl/
+     LngLatBounds, which are unchanged from 3.x. -->
+<link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
 <style>
     .main-content-container {
         background: rgba(15, 23, 42, 0.92);
@@ -301,6 +309,36 @@
             <div class="card stat-card h-100" style="border-color: #f59e0b;">
                 <label class="text-white-50 small text-uppercase fw-bold">{{ translate('pending') }}</label>
                 <div class="h3 fw-bold">{{ pending_reports }}</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Urban Digital Twin -->
+    <div class="row g-3 mb-4">
+        <div class="col-12">
+            <div class="card overflow-hidden">
+                <div class="card-header py-2 d-flex justify-content-between align-items-center flex-wrap gap-2"
+                     style="background: #151b2b; border-bottom: 1px solid rgba(255,255,255,0.1);">
+                    <h6 class="m-0 fw-bold d-flex align-items-center gap-2" style="font-size: 15px; color: #f8fafc;">
+                        🌐 Urban Digital Twin — Hyderabad &amp; Bengaluru
+                        <span style="font-size: 10px; font-weight: 700; color: #4ade80; border: 1px solid rgba(74,222,128,0.4); background: rgba(74,222,128,0.08); border-radius: 5px; padding: 1px 6px; letter-spacing: 0.04em;">● LIVE</span>
+                    </h6>
+                    <div class="d-flex align-items-center gap-2">
+                        <span class="text-white-50 small d-none d-md-inline">Click a hexagon for sub-scores, assets, OSINT cameras and street-level imagery</span>
+                        <a href="{{ url_for('twin_pages.digital_twin_page') }}" class="btn btn-sm"
+                           style="border: 1px solid rgba(56,217,255,0.4); color: #38d9ff; border-radius: 6px; padding: 2px 10px; font-size: 12px; font-weight: 500; background: rgba(56,217,255,0.05);">
+                            <i class="fas fa-up-right-and-down-left-from-center me-1"></i>Full screen
+                        </a>
+                    </div>
+                </div>
+                <div class="card-body p-0">
+                    {# Compact rather than the default embedded height: this card
+                       shares the fold with the flood maps, the Windy embeds and
+                       the charts below it, and a 74vh console pushed all of them
+                       a full screen further down. #}
+                    {% set twin_variant = 'compact' %}
+                    {% include "partials/twin_console.html" %}
+                </div>
             </div>
         </div>
     </div>
@@ -1537,8 +1575,7 @@
 {% endblock %}
 
 {% block scripts %}
-<!-- Load MapLibre 3D Engine -->
-<script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
+<!-- MapLibre itself is loaded in <head>; see the note there. -->
 <script src="{{ url_for('static', filename='js/god-mode-maps.js') }}"></script>
 <!-- Load Plugins -->
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>

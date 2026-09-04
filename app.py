@@ -67,6 +67,56 @@ scheduler = BackgroundScheduler()
 scheduler.start()
 atexit.register(lambda: scheduler.shutdown())
 
+# ---------------------------------------------------------------------------
+# Urban Digital Twin (twin/ package)
+#
+# Additive wiring only: one blueprint pair, its own tables, its own jobs on
+# the scheduler that already exists above. No existing route, model or
+# template changes shape because of this block. See DIGITAL_TWIN.md.
+# ---------------------------------------------------------------------------
+try:
+    from twin import create_twin_blueprint
+    from twin.seed import seed_metadata as _twin_seed_metadata
+    from twin.ingest.internal_reports import register_approval_hook, register_report_model
+
+    create_twin_blueprint(
+        app, db,
+        scheduler=scheduler,
+        login_required=login_required,   # the app's own Flask-Login decorator
+        # role_required is deliberately not passed: this app gates roles with
+        # inline `current_user.role not in [...]` checks rather than a
+        # decorator, so the twin falls back to twin/security.py, which reads
+        # the same `User.role` attribute and returns 401/403 as JSON.
+        seed=False,                      # tables may not exist yet; seeded below
+    )
+
+    # This app provisions its schema with create_all() rather than migrations
+    # (instance/site.db carries no alembic_version), so the twin's tables are
+    # created the same way. The Alembic revision in migrations/versions is
+    # still there and still correct for deployments that do run `flask db
+    # upgrade` -- both paths produce the same tables.
+    with app.app_context():
+        db.create_all()
+        _twin_seed_metadata(db)
+
+    # Report.timestamp, not created_at; this schema has no image_url column,
+    # so the twin reads the stored filename and the page resolves it under
+    # /uploads/. Everything else matches the twin's defaults.
+    register_report_model(Report, timestamp_attr='timestamp', image_url_attr='image_file')
+
+    with app.app_context():
+        from twin import stream as twin_stream
+        register_approval_hook(
+            db,
+            on_approved=lambda report: twin_stream.publish("incident", city=None, report=report),
+        )
+except Exception as _twin_exc:  # noqa: BLE001
+    # The twin is an enhancement layer. If it cannot start, the 119 routes
+    # below it still must.
+    import traceback
+    print(f"[twin] digital twin not registered: {_twin_exc}")
+    traceback.print_exc()
+
 # Sample data for dashboard (would be replaced with real data)
 sample_reports = [
     {
@@ -3988,7 +4038,24 @@ def new_emergency():
         return redirect(url_for('home'))
     
     form = EmergencyEventForm()
-    
+
+    # Prefill from query params so the Digital Twin's "Declare Emergency"
+    # action can hand the operator a form already pointed at the hexagon
+    # they clicked. GET-only, so the POST path below is untouched.
+    if request.method == 'GET':
+        numeric_fields = ('latitude', 'longitude', 'radius_km')
+        for field_name in ('title', 'description', 'hazard_type', 'severity',
+                           'location') + numeric_fields:
+            value = request.args.get(field_name)
+            if not value:
+                continue
+            if field_name in numeric_fields:
+                try:
+                    value = float(value)
+                except ValueError:
+                    continue
+            getattr(form, field_name).data = value
+
     if form.validate_on_submit():
         emergency = EmergencyEvent(
             title=form.title.data,
@@ -4891,6 +4958,56 @@ def get_nearby_volunteers():
             'location': hazard.location
         },
         'volunteers': nearby_volunteers
+    })
+
+@app.route("/api/coordination/volunteers/near-point", methods=['GET'])
+@login_required
+def get_volunteers_near_point():
+    """Volunteers near an arbitrary lat/lng, rather than near a saved hazard.
+
+    The existing /volunteers/nearby endpoint resolves its coordinates from an
+    EmergencyEvent or Report row, so it cannot answer "who is near this map
+    cell?" -- which is exactly what the Digital Twin's drill-down asks before
+    any emergency record exists. Same distance maths, same serialisation,
+    different starting point.
+    """
+    if current_user.role not in ['official', 'analyst', 'admin', 'coordinator']:
+        return jsonify({'error': 'Unauthorized'}), 403
+
+    lat = request.args.get('lat', type=float)
+    lng = request.args.get('lng', type=float)
+    if lat is None or lng is None:
+        return jsonify({'error': 'lat and lng are required'}), 400
+
+    radius_km = request.args.get('radius_km', default=50.0, type=float)
+    radius_km = max(1.0, min(200.0, radius_km))
+
+    volunteers = Volunteer.query.filter(
+        Volunteer.latitude.isnot(None),
+        Volunteer.longitude.isnot(None)
+    ).all()
+
+    nearby = []
+    for volunteer in volunteers:
+        distance = calculate_distance(lat, lng, volunteer.latitude, volunteer.longitude)
+        if distance > radius_km:
+            continue
+        nearby.append({
+            'id': volunteer.id,
+            'name': volunteer.user.username if volunteer.user else 'Unknown',
+            'skills': volunteer.skills,
+            'experience_level': volunteer.experience_level,
+            'availability': volunteer.availability,
+            'location': volunteer.location,
+            'distance_km': round(distance, 2),
+            'is_verified': volunteer.is_verified
+        })
+
+    nearby.sort(key=lambda v: v['distance_km'])
+    return jsonify({
+        'point': {'latitude': lat, 'longitude': lng, 'radius_km': radius_km},
+        'count': len(nearby),
+        'volunteers': nearby[:25]
     })
 
 @app.route("/api/coordination/assignment/<int:assignment_id>/accept", methods=['POST'])
@@ -6195,5 +6312,5 @@ if __name__ == '__main__':
         db.create_all()
         init_badges()  # Initialize badges
         os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
-    app.run(debug=True, host='0.0.0.0', port=5001)
+    app.run(debug=True, host='0.0.0.0', port=5001, use_reloader=False)
 
