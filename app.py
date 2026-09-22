@@ -7,6 +7,7 @@ from models import (
     CommunityEvent, EventParticipant, ResourceListing, ResourceMatch
 )
 from config import Config
+from flask_wtf.csrf import CSRFProtect
 from forms import (
     RegistrationForm, LoginForm, ReportForm, ProfileForm, LocationForm, AlertPreferencesForm,
     AgencyForm, EmergencyEventForm, ResourceAllocationForm, VolunteerRegistrationForm,
@@ -22,6 +23,7 @@ from utils import (
 )  # UPDATED
 from werkzeug.security import generate_password_hash, check_password_hash
 import os
+from urllib.parse import urlparse
 import json
 import time
 from datetime import datetime, timedelta
@@ -46,6 +48,17 @@ from twilio.twiml.messaging_response import MessagingResponse
 app = Flask(__name__)
 app.config.from_object(Config)
 
+
+# Site-wide CSRF. Flask-WTF only validated forms that went through a
+# FlaskForm, which left the ones reading request.form directly --
+# /verify_report and /reject_report among them -- open to a cross-origin
+# auto-submitting form. Those are an official's approve/reject buttons, so
+# the attack was "get a logged-in official to open a page, and a fabricated
+# report is approved in their name".
+#
+# Browser callers get the token attached automatically by the fetch wrapper
+# in templates/base.html, so individual call sites did not have to change.
+csrf = CSRFProtect(app)
 migrate = Migrate(app, db)
 
 db.init_app(app)
@@ -110,6 +123,42 @@ try:
             db,
             on_approved=lambda report: twin_stream.publish("incident", city=None, report=report),
         )
+
+    # How the twin reaches the public when an analyst dispatches a flag.
+    #
+    # Registered rather than imported, for the same reason the Report model is:
+    # the twin owns no users and must stay testable without this app. These
+    # three callables are the whole contract, and they reuse the notification
+    # and WhatsApp machinery the app already has rather than inventing a
+    # second alerting path that could drift from it.
+    from twin.dispatch import register_alert_channel
+
+    def _twin_recipients_near(lat, lon, radius_km):
+        return [
+            {
+                'id': user.id,
+                'username': user.username,
+                'distance_km': distance,
+                'whatsapp_number': user.whatsapp_number,
+            }
+            for user, distance, _volunteer in _users_near_point(lat, lon, radius_km)
+        ]
+
+    def _twin_notify(user_id, message):
+        db.session.add(Notification(
+            user_id=user_id,
+            message=message,
+            is_alert=True,
+            is_read=False,
+            expires_at=datetime.utcnow() + timedelta(hours=12),
+        ))
+        db.session.commit()
+
+    register_alert_channel(
+        recipients_near=_twin_recipients_near,
+        notify=_twin_notify,
+        send_whatsapp=send_whatsapp_message,
+    )
 except Exception as _twin_exc:  # noqa: BLE001
     # The twin is an enhancement layer. If it cannot start, the 119 routes
     # below it still must.
@@ -1307,12 +1356,34 @@ def login():
             # Check for new notifications or achievements
             check_and_notify_user(user)
             
-            next_page = request.args.get('next')
+            # Only ever redirect back into this app. `next` arrives from the
+            # query string, so an unchecked redirect here is an open redirect:
+            # a link to our own /login?next=https://evil.example lands the user
+            # on the attacker's page wearing our domain's credibility, which is
+            # how credential-harvest pages get clicked.
+            next_page = _safe_next(request.args.get('next'))
             return redirect(next_page) if next_page else redirect(url_for('home'))
         else:
             flash('Login unsuccessful. Please check email and password.', 'danger')
     
     return render_template('login.html', title=translate('login'), form=form)
+
+def _safe_next(target):
+    """`target` if it is a path inside this app, else None.
+
+    Accepts only a root-relative path. Rejects absolute URLs, scheme-relative
+    ones (`//evil.example`, which browsers treat as absolute), and anything
+    carrying a scheme or netloc -- the three shapes an open redirect takes.
+    """
+    if not target:
+        return None
+    parsed = urlparse(target)
+    if parsed.scheme or parsed.netloc:
+        return None
+    if not target.startswith("/") or target.startswith("//"):
+        return None
+    return target
+
 
 def check_and_notify_user(user):
     """Check for new notifications and achievements to display to user"""
@@ -5630,9 +5701,42 @@ def manifest():
     """Serve the manifest file"""
     return send_from_directory('static', 'manifest.json', mimetype='application/json')
 
+def _twilio_request_is_genuine():
+    """Is this POST actually from Twilio?
+
+    The webhook is necessarily public -- Twilio has to reach it without a
+    session -- so the signature is the only thing separating a real inbound
+    message from anyone who knows the URL. Without this check a stranger can
+    POST a spoofed `From` and drive whatever the webhook drives: registering
+    as a volunteer, triggering alerts, reading back another person's data.
+
+    Fails closed when the auth token is configured. When it is not, the
+    WhatsApp integration is not set up at all, so the endpoint refuses rather
+    than running unauthenticated.
+    """
+    token = app.config.get('TWILIO_AUTH_TOKEN')
+    if not token:
+        return False
+    try:
+        from twilio.request_validator import RequestValidator
+    except Exception:  # noqa: BLE001 - library absent means it cannot be verified
+        app.logger.error("twilio request_validator unavailable; refusing webhook")
+        return False
+
+    signature = request.headers.get('X-Twilio-Signature', '')
+    return RequestValidator(token).validate(
+        request.url, request.form.to_dict(), signature)
+
+
 @app.route('/webhook/whatsapp', methods=['POST'])
+@csrf.exempt  # Twilio cannot carry our CSRF token; it proves itself by signature instead.
 def whatsapp_webhook():
     """Twilio WhatsApp Webhook: Authentication, Alerts, and Volunteer Coordination"""
+    if not _twilio_request_is_genuine():
+        app.logger.warning("rejected unsigned WhatsApp webhook from %s",
+                           request.remote_addr)
+        return ('', 403)
+
     incoming_msg = request.values.get('Body', '').lower().strip()
     from_number = request.values.get('From', '') # Format: whatsapp:+123456789
     
@@ -6312,5 +6416,17 @@ if __name__ == '__main__':
         db.create_all()
         init_badges()  # Initialize badges
         os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
-    app.run(debug=True, host='0.0.0.0', port=5001, use_reloader=False)
+    # debug=True serves the Werkzeug interactive debugger, which executes
+    # arbitrary Python from the browser on any traceback. Bound to 0.0.0.0 it
+    # was that console offered to the whole network. Both are now opt-in and
+    # default off, and the default bind is loopback.
+    #
+    # run_server.py is the supported launcher; this block is the fallback.
+    debug = os.environ.get('FLASK_DEBUG', '0').strip() == '1'
+    host = os.environ.get('FLASK_HOST', '127.0.0.1').strip()
+    if debug and host != '127.0.0.1':
+        raise SystemExit(
+            "Refusing to start: FLASK_DEBUG=1 exposes a remote code execution "
+            "console, and FLASK_HOST is not loopback. Pick one.")
+    app.run(debug=debug, host=host, port=5001, use_reloader=False)
 

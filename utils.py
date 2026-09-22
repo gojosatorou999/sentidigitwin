@@ -1183,7 +1183,7 @@ def fetch_live_flood_gauges(stations):
 
 
 def sync_reports_to_csv(Report):
-    """Sync all reports from the database to all_reports.csv and all_reports_export.csv"""
+    """Sync all reports from the database to all_reports.csv."""
     try:
         reports = Report.query.all()
         # Define the header based on the system fields and user requirements
@@ -1200,7 +1200,6 @@ def sync_reports_to_csv(Report):
         # Files are saved in the project root
         project_root = os.path.dirname(os.path.abspath(__file__))
         file_path = os.path.join(project_root, 'all_reports.csv')
-        export_path = os.path.join(project_root, 'all_reports_export.csv')
         
         with open(file_path, 'w', newline='', encoding='utf-8') as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=headers)
@@ -1219,9 +1218,6 @@ def sync_reports_to_csv(Report):
                     else:
                         row[h] = val
                 writer.writerow(row)
-        
-        # Also update the export version
-        shutil.copy2(file_path, export_path)
         
         print(f"✅ REAL-TIME SYNC: {len(reports)} reports exported to CSV.")
         return True

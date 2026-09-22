@@ -12,13 +12,19 @@ import logging
 import math
 from datetime import timedelta
 
+import requests
+
 from flask import (Blueprint, Response, current_app, jsonify, render_template,
                    request, stream_with_context)
 from sqlalchemy import func
 
+from . import alerts as twin_alerts
+from . import cameras as twin_cameras
 from . import config
+from . import dispatch as twin_dispatch
 from . import engine
 from . import grid
+from . import live as twin_live
 from . import models as m
 from . import serializers as ser
 from . import stream as twin_stream
@@ -1112,3 +1118,519 @@ def refresh():
             results[slug] = {"error": str(exc)}
 
     return jsonify(results)
+
+
+# --------------------------------------------------------------------------
+# Official external alerts (NDMA SACHET, GDACS, USGS)
+# --------------------------------------------------------------------------
+
+@twin_bp.get("/<city>/alerts")
+@twin_roles_required
+def city_alerts(city):
+    """Alerts in force: polygons as GeoJSON, the rest as advisories.
+
+    Deliberately two collections rather than one. A CAP polygon is a surveyed
+    footprint published by the issuing authority; a district-scoped advisory
+    is not, and inventing a shape for it would put a drawn boundary on the map
+    that no authority ever drew.
+    """
+    db = _db()
+    city_row = _get_city(db, city)
+    if city_row is None:
+        return _error("unknown city %r" % city, 404)
+
+    payload = twin_alerts.alerts_feature_collection(db, city_row)
+    payload["city"] = city_row.slug
+    payload["generated_at"] = ser.iso(m.utcnow())
+
+    response = jsonify(payload)
+    return ser.apply_cache_headers(
+        response, etag=ser.etag_for(city_row.slug, len(payload["features"]),
+                                    len(payload["advisories"])), max_age=30)
+
+
+@twin_bp.post("/alerts/refresh")
+@official_only
+def alerts_refresh():
+    """Poll the alert feeds now, for one city or all of them."""
+    db = _db()
+    body = request.get_json(silent=True) or {}
+    city_slug = body.get("city") or "all"
+    slugs = list(config.CITY_ORDER) if city_slug == "all" else [city_slug]
+
+    results = {}
+    for slug in slugs:
+        city_row = _get_city(db, slug)
+        if city_row is None:
+            results[slug] = {"error": "unknown city"}
+            continue
+        try:
+            results[slug] = twin_alerts.ingest_city_alerts(db, city_row)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("alert refresh failed for %s", slug)
+            results[slug] = {"error": str(exc)}
+    return jsonify(results)
+
+
+# --------------------------------------------------------------------------
+# Live point layers: pollution stations, transit vehicles, water sensors
+# --------------------------------------------------------------------------
+
+#: URL segment -> TwinObservation.kind. An explicit allow-list, so the path
+#: parameter can never become a filter an operator did not intend.
+LIVE_KINDS = {
+    "air": "air_quality",
+    "transit": "transit_vehicle",
+    "water": "water_level",
+}
+
+
+@twin_bp.get("/<city>/live/<kind>")
+@twin_roles_required
+def city_live_layer(city, kind):
+    db = _db()
+    city_row = _get_city(db, city)
+    if city_row is None:
+        return _error("unknown city %r" % city, 404)
+
+    resolved = LIVE_KINDS.get(kind)
+    if resolved is None:
+        return _error("kind must be one of %s" % sorted(LIVE_KINDS), 400)
+
+    payload = twin_live.observations_feature_collection(db, city_row, kind=resolved)
+    payload["city"] = city_row.slug
+    payload["kind"] = resolved
+    payload["generated_at"] = ser.iso(m.utcnow())
+
+    # Short max-age: this is the layer whose whole purpose is being current.
+    response = jsonify(payload)
+    return ser.apply_cache_headers(response, max_age=15)
+
+
+@twin_bp.get("/<city>/live")
+@twin_roles_required
+def city_live_summary(city):
+    """Per-layer counts and freshness for the console's live-status strip."""
+    db = _db()
+    city_row = _get_city(db, city)
+    if city_row is None:
+        return _error("unknown city %r" % city, 404)
+
+    return jsonify({
+        "city": city_row.slug,
+        "layers": twin_live.live_summary(db, city_row),
+        "generated_at": ser.iso(m.utcnow()),
+    })
+
+
+@twin_bp.post("/live/refresh")
+@official_only
+def live_refresh():
+    """Poll the live point sources now."""
+    db = _db()
+    body = request.get_json(silent=True) or {}
+    city_slug = body.get("city") or "all"
+    slugs = list(config.CITY_ORDER) if city_slug == "all" else [city_slug]
+
+    results = {}
+    for slug in slugs:
+        city_row = _get_city(db, slug)
+        if city_row is None:
+            results[slug] = {"error": "unknown city"}
+            continue
+        results[slug] = {
+            "stations": twin_live.refresh_stations(db, city_row),
+            "transit": twin_live.refresh_transit(db, city_row),
+            "global_events": twin_live.refresh_global_events(db, city_row),
+        }
+    return jsonify(results)
+
+
+# --------------------------------------------------------------------------
+# Agent flags and the analyst's review queue
+#
+# The human gate lives here. The agent writes `pending` rows; nothing reaches
+# the public until an analyst acts through one of these endpoints, which
+# mirrors the host app's existing rule that a citizen report is invisible
+# until somebody approves it.
+# --------------------------------------------------------------------------
+
+@twin_bp.get("/<city>/flags")
+@twin_roles_required
+def city_flags(city):
+    db = _db()
+    city_row = _get_city(db, city)
+    if city_row is None:
+        return _error("unknown city %r" % city, 404)
+
+    status = request.args.get("status")
+    query = db.session.query(m.TwinFlag).filter(m.TwinFlag.city_id == city_row.id)
+    if status:
+        query = query.filter(m.TwinFlag.status == status)
+
+    rows = query.order_by(m.TwinFlag.risk_score.desc()).limit(100).all()
+    # An expired flag stays in the table for the audit trail but must not be
+    # presented as current -- a stale flag is exactly as misleading as a stale
+    # reading, and harder to spot because it looks like a decision.
+    now = m.utcnow()
+    rows = [row for row in rows
+            if row.expires_at is None or row.expires_at > now
+            or row.status != "pending"]
+
+    flags = [_flag_payload(db, row) for row in rows]
+    payload = {
+        "city": city_row.slug,
+        "flags": flags,
+        "pending": sum(1 for flag in flags if flag["status"] == "pending"),
+        "generated_at": ser.iso(now),
+    }
+
+    if request.args.get("geometry") == "true":
+        payload["geojson"] = _flags_geojson(db, rows)
+
+    return jsonify(payload)
+
+
+def _flag_payload(db, row):
+    return {
+        "id": row.id,
+        "cluster_key": row.cluster_key,
+        "hazard_type": row.hazard_type,
+        "title": row.title,
+        "severity": row.severity,
+        "risk_score": row.risk_score,
+        "confidence": row.confidence,
+        "cell_count": row.cell_count,
+        "brief_md": row.brief_md,
+        "citations": row.citations or [],
+        "evidence": row.evidence or {},
+        "agent_mode": row.agent_mode,
+        "status": row.status,
+        "reviewed_by": row.reviewed_by,
+        "reviewed_at": ser.iso(row.reviewed_at),
+        "created_at": ser.iso(row.created_at),
+        "expires_at": ser.iso(row.expires_at),
+        "center": _flag_centre(db, row),
+    }
+
+
+def _flag_centre(db, row):
+    import h3
+
+    if row.headline_h3:
+        try:
+            lat, lon = h3.cell_to_latlng(row.headline_h3)
+            return {"lat": lat, "lon": lon}
+        except Exception:  # noqa: BLE001
+            return None
+    return None
+
+
+def _flags_geojson(db, rows):
+    """Each flag's footprint as one polygon per covered cell."""
+    import h3
+
+    features = []
+    for row in rows:
+        if row.status not in ("pending", "approved"):
+            continue
+        cells = db.session.query(m.TwinFlagCell).filter_by(flag_id=row.id).all()
+        for link in cells:
+            try:
+                ring = h3.cell_to_boundary(link.h3_index)
+            except Exception:  # noqa: BLE001
+                continue
+            coordinates = [[lon, lat] for lat, lon in ring]
+            coordinates.append(coordinates[0])
+            features.append({
+                "type": "Feature",
+                "geometry": {"type": "Polygon", "coordinates": [coordinates]},
+                "properties": {"flag_id": row.id, "status": row.status,
+                               "severity": row.severity, "title": row.title},
+            })
+    return {"type": "FeatureCollection", "features": features}
+
+
+@twin_bp.post("/flags/<int:flag_id>/review")
+@twin_roles_required
+def review_flag(flag_id):
+    """Approve or dismiss a flag. Approving does not alert anybody."""
+    db = _db()
+    row = db.session.query(m.TwinFlag).get(flag_id)
+    if row is None:
+        return _error("unknown flag %s" % flag_id, 404)
+
+    body = request.get_json(silent=True) or {}
+    decision = (body.get("decision") or "").strip().lower()
+    if decision not in ("approve", "reject"):
+        return _error("decision must be 'approve' or 'reject'", 400)
+
+    row.status = "approved" if decision == "approve" else "rejected"
+    row.review_note = (body.get("note") or "")[:2000]
+    row.reviewed_at = m.utcnow()
+    row.reviewed_by = _current_user_id()
+    db.session.commit()
+
+    return jsonify({"success": True, "flag": _flag_payload(db, row)})
+
+
+@twin_bp.get("/flags/<int:flag_id>/dispatch/preview")
+@twin_roles_required
+def dispatch_preview(flag_id):
+    """How many people an alert would reach, before anyone commits to it."""
+    db = _db()
+    row = db.session.query(m.TwinFlag).get(flag_id)
+    if row is None:
+        return _error("unknown flag %s" % flag_id, 404)
+
+    radius = request.args.get("radius_km", type=float)
+    result = twin_dispatch.preview(db, row, radius_km=radius)
+    if not result.get("available"):
+        return _error(result.get("error") or "dispatch unavailable", 503)
+    return jsonify(result)
+
+
+@twin_bp.post("/flags/<int:flag_id>/dispatch")
+@official_only
+def dispatch_flag(flag_id):
+    """Send the alert to people in range. Officials and admins only."""
+    db = _db()
+    row = db.session.query(m.TwinFlag).get(flag_id)
+    if row is None:
+        return _error("unknown flag %s" % flag_id, 404)
+
+    body = request.get_json(silent=True) or {}
+    result = twin_dispatch.send(
+        db, row,
+        sent_by=_current_user_id(),
+        sent_by_username=_current_username(),
+        radius_km=body.get("radius_km"),
+        message=body.get("message"),
+        force=bool(body.get("force")),
+    )
+    if not result.get("success"):
+        code = 429 if result.get("cooldown_active") else 400
+        return jsonify(result), code
+
+    twin_stream.publish("flags", city=row.city_id, dispatched=row.id)
+    return jsonify(result)
+
+
+@twin_bp.post("/agent/run")
+@official_only
+def agent_run():
+    """Run a triage pass now, rather than waiting for the scheduler."""
+    db = _db()
+    body = request.get_json(silent=True) or {}
+    slugs = (list(config.CITY_ORDER) if (body.get("city") or "all") == "all"
+             else [body["city"]])
+
+    try:
+        from .agent import run_triage
+    except Exception as exc:  # noqa: BLE001
+        return _error("agent unavailable: %s" % exc, 503)
+
+    results = {}
+    for slug in slugs:
+        city_row = _get_city(db, slug)
+        if city_row is None:
+            results[slug] = {"error": "unknown city"}
+            continue
+        results[slug] = run_triage(db, city_row)
+    return jsonify(results)
+
+
+@twin_bp.get("/agent/status")
+@twin_roles_required
+def agent_status():
+    """What the agent is running on: which engine, which model, which corpus."""
+    try:
+        from . import agent
+
+        payload = agent.describe()
+    except Exception as exc:  # noqa: BLE001
+        payload = {"available": False, "error": str(exc)}
+
+    payload["enabled"] = config.AGENT_ENABLED
+    payload["flag_threshold"] = config.FLAG_THRESHOLD
+    payload["dispatch"] = twin_dispatch.describe()
+    return jsonify(payload)
+
+
+def _current_user_id():
+    try:
+        from flask_login import current_user
+
+        return getattr(current_user, "id", None)
+    except Exception:  # noqa: BLE001 - no login extension on this host
+        return None
+
+
+def _current_username():
+    try:
+        from flask_login import current_user
+
+        return getattr(current_user, "username", None)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+@twin_bp.get("/cctv/streams")
+@twin_roles_required
+def cctv_streams():
+    """Live camera feeds for a city: operator-supplied, plus public providers.
+
+    Two sources, merged (twin/cameras.py). The operator's own JSON file is
+    one deployment's hand-listed feeds and always wins. Public road-authority
+    catalogs (twin/ingest/cctv_live.py) fill in the rest -- but only where an
+    authority actually operates, so nothing foreign is ever shown standing in
+    for local ground.
+
+    Empty is a real and expected answer for Hyderabad and Bengaluru: no
+    authority publishes a camera catalog for either, and ``providers`` says
+    so explicitly rather than leaving an operator guessing. The server never
+    fetches or proxies any of these URLs; the browser loads them directly.
+    """
+    db = _db()
+    city_slug = request.args.get("city")
+    city_row = _get_city(db, city_slug) if city_slug else None
+
+    bbox = None
+    if city_row is not None:
+        # Same source as every other city-scoped layer: the persisted row,
+        # not the static defaults, so a re-clipped city keeps one extent.
+        bbox = (city_row.bbox_min_lon, city_row.bbox_min_lat,
+                city_row.bbox_max_lon, city_row.bbox_max_lat)
+
+    streams, meta = twin_cameras.live_streams(
+        db, city_slug=city_row.slug if city_row else None, bbox=bbox)
+
+    return jsonify({
+        "streams": streams,
+        "count": len(streams),
+        "configured": meta["configured_count"] > 0,
+        "configured_count": meta["configured_count"],
+        "provider_count": meta["provider_count"],
+        "config_file": meta["config_file"],
+        "providers": {
+            "considered": meta["providers_considered"],
+            "status": meta["provider_status"],
+            "enabled": config.CCTV_LIVE_ENABLED,
+        },
+        "status": meta["status"],
+        # Present only when the whole list is a stand-in. Its absence is what
+        # tells the console these feeds are this city's own.
+        "reference": meta.get("reference"),
+        "note": ("Feeds come from operator configuration and from public road "
+                 "authorities that publish a keyless camera catalog for this "
+                 "ground. Where no authority covers a city, no local camera is "
+                 "invented: the list is either empty or, when a reference feed "
+                 "is configured, another authority's cameras returned under a "
+                 "\"reference\" block and flagged individually. Every URL is "
+                 "loaded by the browser directly from the authority that "
+                 "published it; the server never proxies or stores them."),
+    })
+
+
+@twin_bp.get("/cctv/coverage")
+@twin_roles_required
+def cctv_coverage():
+    """Every registered authority, probed live: does it answer, and with how many.
+
+    ``/cctv/providers`` reports the *registry* -- who is configured and whose
+    declared bbox meets a city. It cannot say whether a catalog is actually
+    up, which is the question behind "which of these cameras work". This
+    endpoint fetches each one and reports what came back.
+
+    It is deliberately not on the console's refresh path: it calls every
+    authority in the registry, which is exactly what the coverage gate exists
+    to avoid doing routinely. It is an on-demand diagnostic, cached for the
+    same TTL as the catalogs themselves.
+    """
+    from .ingest.cctv_live import (PROVIDERS, enabled_providers,
+                                   providers_for, reference_provider)
+
+    enabled = {p.key for p in enabled_providers()}
+    cities = _db().session.query(m.TwinCity).filter_by(is_active=True).all()
+    city_boxes = {c.slug: (c.bbox_min_lon, c.bbox_min_lat,
+                           c.bbox_max_lon, c.bbox_max_lat) for c in cities}
+    reference = reference_provider()
+
+    rows, session = [], requests.Session()
+    session.headers["User-Agent"] = "SentinelAI-twin/1.0"
+    for provider in PROVIDERS:
+        row = dict(provider.as_dict(),
+                   enabled=provider.key in enabled,
+                   is_reference=bool(reference and reference.key == provider.key),
+                   covers={slug: provider.covers(bbox)
+                           for slug, bbox in city_boxes.items()})
+        if provider.key not in enabled:
+            row.update(status="disabled", cameras=0, sample=None)
+            rows.append(row)
+            continue
+        try:
+            cameras = provider.fetch(session, config.CCTV_LIVE_TIMEOUT_S) or []
+            sample = cameras[0] if cameras else None
+            row.update(
+                status="ok" if cameras else "empty",
+                cameras=len(cameras),
+                sample={"name": sample["name"], "url": sample["url"],
+                        "type": sample["type"]} if sample else None)
+        except Exception as exc:  # noqa: BLE001 - one dead authority is a row, not a 500
+            log.warning("cctv coverage probe failed for %s (%s)", provider.key, exc)
+            row.update(status="failed: %s" % str(exc)[:120], cameras=0, sample=None)
+        rows.append(row)
+
+    working = [r for r in rows if r["status"] == "ok"]
+    return jsonify({
+        "providers": rows,
+        "total_cameras": sum(r["cameras"] for r in rows),
+        "working_count": len(working),
+        "registry_count": len(rows),
+        "cities": sorted(city_boxes),
+        "reference": reference.key if reference else None,
+        "note": ("Probed live, one request per authority. 'covers' is the "
+                 "coverage gate's answer per modelled city -- a provider can "
+                 "be working and still show no cameras in a city it does not "
+                 "serve, which is the intended behaviour, not a fault."),
+    })
+
+
+@twin_bp.get("/cctv/providers")
+@twin_roles_required
+def cctv_providers():
+    """Which camera authorities are registered, and what ground each covers.
+
+    An operator asking "why is this panel empty?" gets the answer here: the
+    whole registry, with the subset that matches a given bbox marked. It
+    takes an optional ``city`` so the answer can be city-specific.
+    """
+    from .ingest.cctv_live import PROVIDERS, enabled_providers, providers_for
+
+    city_slug = request.args.get("city")
+    city_row = _get_city(_db(), city_slug) if city_slug else None
+    bbox = None
+    if city_row is not None:
+        bbox = (city_row.bbox_min_lon, city_row.bbox_min_lat,
+                city_row.bbox_max_lon, city_row.bbox_max_lat)
+
+    enabled = {p.key for p in enabled_providers()}
+    matching = {p.key for p in providers_for(bbox)} if bbox else set()
+
+    return jsonify({
+        "enabled": config.CCTV_LIVE_ENABLED,
+        "city": city_row.slug if city_row else None,
+        "bbox": list(bbox) if bbox else None,
+        "providers": [
+            dict(provider.as_dict(),
+                 enabled=provider.key in enabled,
+                 covers_city=provider.key in matching)
+            for provider in PROVIDERS
+        ],
+        "matching_count": len(matching),
+        "note": ("A provider is fetched only when its service area meets the "
+                 "city's bbox. No registered authority covers Hyderabad or "
+                 "Bengaluru; when one publishes a catalog it becomes a "
+                 "registry entry and those cities populate with no other "
+                 "code change."),
+    })

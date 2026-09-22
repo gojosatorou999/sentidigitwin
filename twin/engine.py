@@ -23,6 +23,7 @@ than just documented:
 import logging
 import time
 
+from . import anomaly
 from . import config
 from . import geo
 from . import models as m
@@ -36,6 +37,11 @@ log = logging.getLogger("twin.engine")
 
 _FORECAST_WINDOW_KEY = {0: "rain_forecast_mm_3h", 3: "rain_forecast_mm_3h",
                         6: "rain_forecast_mm_6h", 24: "rain_forecast_mm_24h"}
+
+#: Which baseline an anomaly at each horizon is judged against. "Now" is
+#: compared to the 1-hour distribution and the forecast windows to their own,
+#: because 40 mm in an hour and 40 mm over a day are not the same event.
+_ANOMALY_METRIC_KEY = {0: "rain_1h", 3: "rain_3h", 6: "rain_3h", 24: "rain_24h"}
 
 
 def compute_state(db, city, horizons=config.HORIZONS, lattice_spacing_km=5.0):
@@ -58,6 +64,15 @@ def compute_state(db, city, horizons=config.HORIZONS, lattice_spacing_km=5.0):
     aq_by_point, aq_status = _fetch_airquality(db, city, lattice)
     discharge, flood_status = _fetch_flood(db, city)
     reports_by_cell, incident_status = _fetch_incidents(db, city, cells)
+
+    # The live-data extension. Each of these is read from what has already
+    # been persisted rather than fetched here, so the score and the map always
+    # describe the same instant -- a score citing vehicles the operator cannot
+    # see on screen is unauditable.
+    alerts_by_cell = _fetch_alert_cells(db, city)
+    disruption_by_cell = _fetch_transit_disruption(db, city)
+    baselines_by_cell = _load_baselines(db, cells)
+    station_aqi_by_cell = _fetch_station_aqi(db, city, cells)
 
     degraded_sources = {
         key for key, status in (
@@ -83,6 +98,10 @@ def compute_state(db, city, horizons=config.HORIZONS, lattice_spacing_km=5.0):
             row = _score_one_cell_horizon(
                 cell, horizon, weather, air, discharge, reports,
                 elevation_population, degraded_sources,
+                alerts=alerts_by_cell.get(cell.h3_index) or [],
+                disruption_stats=disruption_by_cell.get(cell.h3_index),
+                baselines=baselines_by_cell.get(cell.id) or {},
+                station_aqi=station_aqi_by_cell.get(cell.h3_index),
             )
             rows_by_key[(cell.id, horizon)] = row
 
@@ -107,9 +126,12 @@ def compute_state(db, city, horizons=config.HORIZONS, lattice_spacing_km=5.0):
 # --------------------------------------------------------------------------
 
 def _score_one_cell_horizon(cell, horizon, weather, air, discharge, reports,
-                            elevation_population, degraded_sources):
+                            elevation_population, degraded_sources,
+                            alerts=(), disruption_stats=None, baselines=None,
+                            station_aqi=None):
     weather = weather or {}
     air = air or {}
+    baselines = baselines or {}
 
     rain_now = weather.get("rain_now_mm_1h")
     rain_forecast = weather.get(_FORECAST_WINDOW_KEY[horizon])
@@ -123,10 +145,30 @@ def _score_one_cell_horizon(cell, horizon, weather, air, discharge, reports,
     terrain = cell.terrain_score_cached
     infra = scoring.infra_score(cell.infra_criticality_cached)
 
-    env, env_dropped = scoring.env_score(air.get("us_aqi"), weather.get("apparent_temp_c"))
+    # A station's measured AQI beats a 5 km reanalysis grid cell when one is
+    # in range: the thing that spikes an Indian city's air is local, and a
+    # model that smooths over 5 km cannot see it. The modelled value stays as
+    # the fallback so a city with no nearby station still scores.
+    measured_aqi = (station_aqi or {}).get("aqi")
+    env, env_dropped = scoring.env_score(
+        measured_aqi if measured_aqi is not None else air.get("us_aqi"),
+        weather.get("apparent_temp_c"))
+
+    alert_pressure = anomaly.alert_pressure(alerts) if alerts else None
+    disruption = anomaly.transit_disruption_score(disruption_stats)
+
+    # Anomaly is judged on the rain window this horizon actually cares about,
+    # against the matching baseline metric.
+    anomaly_metric = _ANOMALY_METRIC_KEY[horizon]
+    anomaly_score = anomaly.anomaly_score(
+        rain_forecast if horizon else rain_now, baselines.get(anomaly_metric))
+    rain_exceedance = anomaly.exceedance(
+        rain_forecast if horizon else rain_now, baselines.get(anomaly_metric))
 
     result = scoring.composite(hydro=hydro, incident=incident, env=env,
-                               terrain=terrain, infra=infra)
+                               terrain=terrain, infra=infra,
+                               alert=alert_pressure, disruption=disruption,
+                               anomaly=anomaly_score)
 
     # Merge structural drops (renormalisation happened) with source-level
     # degradation (the adapter itself failed this run) -- an official needs
@@ -149,12 +191,23 @@ def _score_one_cell_horizon(cell, horizon, weather, air, discharge, reports,
         "river_discharge_m3s": discharge_now,
         "river_discharge_2yr_return_m3s": discharge_2yr,
         "us_aqi": air.get("us_aqi"),
+        "station_aqi": measured_aqi,
+        "station_name": (station_aqi or {}).get("name"),
         "apparent_temp_c": weather.get("apparent_temp_c"),
         "elevation_m": cell.elevation_m,
         "dist_to_water_m": cell.dist_to_water_m,
         "drain_length_m": cell.drain_length_m,
         "infra_criticality_cached": cell.infra_criticality_cached,
         "incident_count_raw": incident_count,
+        # The live-data extension's own working, kept beside the rest so C3
+        # ("show your working") still holds for the new terms.
+        "official_alert_count": len(alerts or ()),
+        "official_alert_pressure": alert_pressure,
+        "transit_stall_rate": (disruption_stats or {}).get("stall_rate"),
+        "transit_vehicles": (disruption_stats or {}).get("vehicles"),
+        "anomaly_score": anomaly_score,
+        "anomaly_multiplier": result.get("anomaly_multiplier"),
+        "rain_exceedance": rain_exceedance,
     }
 
     return {
@@ -231,6 +284,106 @@ def _fetch_incidents(db, city, cells):
                 by_cell.setdefault(neighbour, []).append((report, False))
 
     return by_cell, status
+
+
+def _fetch_alert_cells(db, city):
+    """{h3_index: [alert_row, ...]} for alerts in force with a real footprint.
+
+    District-scoped advisories deliberately do not appear here. They are real
+    and an operator sees them in the alert panel, but attributing a state-wide
+    IMD advisory to all 940 cells would push the whole city up a band on a
+    routine monsoon afternoon -- and a map that is amber every day is a map
+    nobody looks at.
+    """
+    try:
+        from . import alerts as alerts_module
+
+        return alerts_module.alert_cells_by_h3(db, city)
+    except Exception:  # noqa: BLE001 - C1: a feed must never break compute
+        log.exception("alert lookup failed for %s; scoring without alerts", city.slug)
+        return {}
+
+
+def _fetch_transit_disruption(db, city):
+    try:
+        from . import live as live_module
+
+        return live_module.transit_disruption(db, city)
+    except Exception:  # noqa: BLE001
+        log.exception("transit lookup failed for %s; scoring without it", city.slug)
+        return {}
+
+
+def _fetch_station_aqi(db, city, cells):
+    """{h3_index: {aqi, name, ...}} from measured stations, spread to neighbours.
+
+    A city has tens of stations and ~900 cells, so a station is attributed to
+    its own cell and its immediate ring rather than interpolated across the
+    whole city: an instrument describes its street, and claiming it describes
+    somewhere 4 km away is exactly the overreach the modelled layer already
+    makes. Cells with no station in range keep the modelled value.
+    """
+    try:
+        import h3
+
+        from . import models as models_module
+
+        rows = (db.session.query(models_module.TwinObservation)
+                .filter(models_module.TwinObservation.city_id == city.id,
+                        models_module.TwinObservation.kind == "air_quality")
+                .all())
+    except Exception:  # noqa: BLE001
+        log.exception("station lookup failed for %s", city.slug)
+        return {}
+
+    by_cell = {}
+    for row in rows:
+        if row.value is None or not row.h3_index:
+            continue
+        # A station that stopped reporting must not keep scoring the city.
+        if row.status == "stale":
+            continue
+
+        entry = {"aqi": row.value, "name": row.name, "source": row.source_key,
+                 "unit": row.unit, "distance_rings": 0}
+        by_cell.setdefault(row.h3_index, entry)
+        try:
+            for neighbour in h3.grid_disk(row.h3_index, 1):
+                if neighbour == row.h3_index:
+                    continue
+                by_cell.setdefault(neighbour, dict(entry, distance_rings=1))
+        except Exception:  # noqa: BLE001 - malformed index
+            continue
+
+    valid = {cell.h3_index for cell in cells}
+    return {k: v for k, v in by_cell.items() if k in valid}
+
+
+def _load_baselines(db, cells):
+    """{cell_id: {metric: baseline_row}} for the current calendar month.
+
+    Scoped to this month because that is what "normal" means operationally:
+    60 mm in three hours is routine in a Bengaluru July and remarkable in
+    February, and an all-year baseline would call the monsoon an anomaly every
+    single day of it.
+    """
+    try:
+        from . import models as models_module
+
+        month = m.utcnow().month
+        cell_ids = [cell.id for cell in cells]
+        rows = (db.session.query(models_module.TwinBaseline)
+                .filter(models_module.TwinBaseline.cell_id.in_(cell_ids),
+                        models_module.TwinBaseline.month == month)
+                .all())
+    except Exception:  # noqa: BLE001
+        log.exception("baseline lookup failed; scoring without anomaly detection")
+        return {}
+
+    by_cell = {}
+    for row in rows:
+        by_cell.setdefault(row.cell_id, {})[row.metric] = row
+    return by_cell
 
 
 def _idw_for_cell(cell, lattice, values_by_point):

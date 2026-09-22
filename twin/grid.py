@@ -113,7 +113,8 @@ def generate_cells_for_city(db, city, force=False):
     if clip_polygon is None:
         raise RuntimeError(
             "no clip polygon for %s at %s -- run scripts/fetch_boundaries.py first "
-            "(see the bbox warning in DIGITAL_TWIN_README.md section 3)"
+            "(a bbox is a camera extent, not a city boundary; clip to the "
+            "admin polygon instead)"
             % (city.slug, _boundary_path(city.slug, "_clip")))
 
     existing_count = db.session.query(m.TwinCell).filter_by(city_id=city.id).count()

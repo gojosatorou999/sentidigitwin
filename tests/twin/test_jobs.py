@@ -23,13 +23,31 @@ class _FakeScheduler:
 
 
 class TestRegisterJobs:
-    def test_registers_the_three_documented_jobs(self, app, db):
+    def test_registers_every_documented_job(self, app, db):
         scheduler = _FakeScheduler()
         twin_jobs.register_jobs(app, db, scheduler)
 
         assert set(scheduler.jobs) == {
             "twin_compute_state", "twin_ingest_radar_index", "twin_refresh_infrastructure",
+            "twin_ingest_alerts", "twin_ingest_stations", "twin_ingest_transit",
+            "twin_agent_triage",
         }
+
+    def test_alert_and_agent_jobs_respect_their_feature_flags(self, app, db, monkeypatch):
+        """TWIN_ALERTS_ENABLED=0 / TWIN_AGENT_ENABLED=0 must be fully supported
+        steady states, not degraded ones (C5): a deployment that wants the twin
+        without either gets a scheduler with neither job on it."""
+        from twin import config
+
+        monkeypatch.setattr(config, "ALERTS_ENABLED", False)
+        monkeypatch.setattr(config, "AGENT_ENABLED", False)
+
+        scheduler = _FakeScheduler()
+        twin_jobs.register_jobs(app, db, scheduler)
+
+        assert "twin_ingest_alerts" not in scheduler.jobs
+        assert "twin_agent_triage" not in scheduler.jobs
+        assert "twin_compute_state" in scheduler.jobs
 
     def test_compute_job_runs_at_the_configured_interval(self, app, db):
         from twin import config

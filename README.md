@@ -1,6 +1,10 @@
 # 🛡️ Sentinel AI — Multi-Agent Urban Disaster & Infrastructure Intelligence Platform
 
-<div align="center">  
+> **Companion document:** [SYSTEMS.md](SYSTEMS.md) covers the two AI
+> agents, the weather and satellite maps, the three camera layers, the
+> security posture and the configuration switches.
+
+<div align="center">
 
 [![Python](https://img.shields.io/badge/Python-3.9+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://python.org)
 [![Flask](https://img.shields.io/badge/Flask-2.3+-000000?style=for-the-badge&logo=flask&logoColor=white)](https://flask.palletsprojects.com) 
@@ -1335,9 +1339,8 @@ sentinel-ai/
 ├── Procfile                # Heroku/Render entry point — `gunicorn app:app`
 ├── start_system.sh         # Helper: start app + ngrok tunnel guidance
 ├── setup_whatsapp.sh       # Twilio WhatsApp sandbox setup script
-├── FRONTEND.md             # Frontend design + component documentation
+├── SYSTEMS.md              # The AI agents, weather/satellite maps, camera layers
 ├── all_reports.csv         # Live CSV mirror of the report table (audit)
-├── all_reports_export.csv  # Export-formatted CSV mirror
 │
 ├── static/
 │   ├── css/

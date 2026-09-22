@@ -17,6 +17,8 @@ __all__ = [
     "init_models", "models_ready", "utcnow", "UTCDateTime",
     "TwinCity", "TwinZone", "TwinCell", "TwinCellState",
     "TwinCellHistory", "TwinInfrastructure", "TwinDataSnapshot",
+    "TwinExternalAlert", "TwinAlertCell", "TwinObservation",
+    "TwinBaseline", "TwinFlag", "TwinFlagCell", "TwinDispatch",
 ]
 
 # Populated by init_models().
@@ -28,6 +30,13 @@ TwinCellState = None
 TwinCellHistory = None
 TwinInfrastructure = None
 TwinDataSnapshot = None
+TwinExternalAlert = None
+TwinAlertCell = None
+TwinObservation = None
+TwinBaseline = None
+TwinFlag = None
+TwinFlagCell = None
+TwinDispatch = None
 
 _READY = False
 
@@ -83,6 +92,8 @@ def init_models(db_):
     global _READY, db
     global TwinCity, TwinZone, TwinCell, TwinCellState
     global TwinCellHistory, TwinInfrastructure, TwinDataSnapshot
+    global TwinExternalAlert, TwinAlertCell, TwinObservation
+    global TwinBaseline, TwinFlag, TwinFlagCell, TwinDispatch
 
     if _READY:
         return _registry()
@@ -292,6 +303,275 @@ def init_models(db_):
         def __repr__(self):
             return "<TwinDataSnapshot %s %s>" % (self.source_key, self.status)
 
+    class _TwinExternalAlert(Model):
+        """One official alert from an external authority (NDMA SACHET, GDACS, USGS).
+
+        Kept structurally separate from the host's citizen ``Report`` table
+        because the two carry different authority: an IMD thunderstorm warning
+        and an anonymous submission may both raise the same sub-score, but an
+        operator deciding whether to evacuate a ward must always be able to see
+        which one they are looking at.
+
+        ``UNIQUE(source, source_uid)`` is what makes re-polling idempotent --
+        SACHET's ``<guid>`` is stable across polls, so a feed re-read updates
+        rows instead of duplicating them.
+        """
+
+        __tablename__ = "twin_external_alert"
+        __table_args__ = (
+            UniqueConstraint("source", "source_uid", name="uq_twin_alert_source_uid"),
+            Index("ix_twin_alert_city_expires", "city_id", "expires_at"),
+            Index("ix_twin_alert_effective", "effective_at"),
+        )
+
+        id = Column(Integer, primary_key=True)
+        source = Column(String(24), nullable=False, index=True)   # sachet|gdacs|usgs
+        source_uid = Column(String(128), nullable=False)
+        cap_identifier = Column(String(128), index=True)
+
+        city_id = Column(Integer, ForeignKey("twin_city.id"), nullable=True, index=True)
+
+        sender = Column(String(255))
+        event = Column(String(255))
+        category = Column(String(64))          # Met|Geo|Safety|Health|...
+        severity = Column(String(24))          # Extreme|Severe|Moderate|Minor|Unknown
+        certainty = Column(String(24))         # Observed|Likely|Possible|Unlikely
+        urgency = Column(String(24))           # Immediate|Expected|Future|Past
+        msg_type = Column(String(24))          # Alert|Update|Cancel|Ack|Error
+
+        headline = Column(Text)
+        description = Column(Text)
+        instruction = Column(Text)
+        area_desc = Column(Text)
+
+        # polygon: a real CAP polygon was fetched and stored.
+        # district: only an LGD/district code or areaDesc was given -- the alert
+        #           is real but its footprint is not, so it must never be drawn
+        #           as if it were a surveyed boundary.
+        # point:    a coordinate + radius (GDACS/USGS).
+        geometry_kind = Column(String(16))
+        geometry_geojson = Column(Text)
+
+        effective_at = Column(UTCDateTime, index=True)
+        onset_at = Column(UTCDateTime)
+        expires_at = Column(UTCDateTime, index=True)
+        sent_at = Column(UTCDateTime)
+
+        # A cap:msgType=Update supersedes the alert it references rather than
+        # adding to it. Without this, an updated warning is counted twice.
+        references_uid = Column(String(255))
+        superseded_at = Column(UTCDateTime)
+
+        raw_url = Column(Text)
+        raw = Column(JSON)
+        fetched_at = Column(UTCDateTime, default=utcnow, nullable=False)
+
+        def __repr__(self):
+            return "<TwinExternalAlert %s %s>" % (self.source, self.event)
+
+    class _TwinAlertCell(Model):
+        """Which H3 cells an alert's polygon actually covers.
+
+        Only written for ``geometry_kind='polygon'``. A district-scoped alert
+        deliberately produces no rows here: inflating one to every cell in the
+        city would light the whole map red on a routine IMD advisory and train
+        operators to ignore the colour.
+        """
+
+        __tablename__ = "twin_alert_cell"
+        __table_args__ = (
+            UniqueConstraint("alert_id", "h3_index", name="uq_twin_alert_cell"),
+            Index("ix_twin_alert_cell_h3", "h3_index"),
+        )
+
+        id = Column(Integer, primary_key=True)
+        alert_id = Column(Integer, ForeignKey("twin_external_alert.id"),
+                          nullable=False, index=True)
+        city_id = Column(Integer, ForeignKey("twin_city.id"), nullable=True, index=True)
+        h3_index = Column(String(20), nullable=False)
+
+    class _TwinObservation(Model):
+        """The latest reading from one live point source (station or vehicle).
+
+        Latest-only by design: ``UNIQUE(source_key, station_uid)`` means a poll
+        updates in place. A live map layer wants "where is every bus now",
+        not "every position every bus has ever had" -- at 5,000 vehicles on a
+        30 s cadence the history variant writes 14 M rows a day and the layer
+        query slows to a crawl. Long-run history for anomaly baselines lives in
+        ``twin_baseline`` instead, computed from archives rather than polling.
+        """
+
+        __tablename__ = "twin_observation"
+        __table_args__ = (
+            UniqueConstraint("source_key", "station_uid", name="uq_twin_obs_source_station"),
+            Index("ix_twin_obs_city_kind", "city_id", "kind"),
+            Index("ix_twin_obs_observed", "observed_at"),
+        )
+
+        id = Column(Integer, primary_key=True)
+        source_key = Column(String(64), nullable=False, index=True)
+        station_uid = Column(String(128), nullable=False)
+        city_id = Column(Integer, ForeignKey("twin_city.id"), nullable=True, index=True)
+
+        # air_quality|water_level|transit_vehicle|traffic|weather_station
+        kind = Column(String(32), nullable=False)
+        name = Column(String(255))
+        operator = Column(String(128))
+
+        latitude = Column(Float)
+        longitude = Column(Float)
+        h3_index = Column(String(20), index=True)
+
+        # The headline number for the layer's colour ramp (AQI, metres, km/h).
+        value = Column(Float)
+        unit = Column(String(24))
+        status = Column(String(24))        # ok|stale|offline|delayed
+        metrics = Column(JSON)             # every other measured field
+        raw = Column(JSON)
+
+        observed_at = Column(UTCDateTime)  # when the *source* measured it
+        fetched_at = Column(UTCDateTime, default=utcnow, nullable=False)
+
+        def __repr__(self):
+            return "<TwinObservation %s %s=%s>" % (self.kind, self.station_uid, self.value)
+
+    class _TwinBaseline(Model):
+        """What "normal" looks like for one cell, one metric, one month.
+
+        This is the memory the anomaly detector needs and the twin did not have:
+        ``twin_cell_history`` starts empty, so "62 mm of rain" cannot be judged
+        abnormal until something says what September usually brings *here*.
+        Populated from open archives (scripts/backfill_baselines.py), not from
+        live polling, so it is useful on day one rather than after a monsoon.
+        """
+
+        __tablename__ = "twin_baseline"
+        __table_args__ = (
+            UniqueConstraint("cell_id", "metric", "month", name="uq_twin_baseline_key"),
+            Index("ix_twin_baseline_metric", "metric", "month"),
+        )
+
+        id = Column(Integer, primary_key=True)
+        cell_id = Column(Integer, ForeignKey("twin_cell.id"), nullable=True, index=True)
+        city_id = Column(Integer, ForeignKey("twin_city.id"), nullable=True, index=True)
+
+        metric = Column(String(48), nullable=False)   # rain_1h|rain_3h|rain_24h|aqi|temp_max
+        month = Column(Integer, nullable=False)       # 1-12; 0 = all-year
+
+        mean = Column(Float)
+        stddev = Column(Float)
+        p50 = Column(Float)
+        p90 = Column(Float)
+        p95 = Column(Float)
+        p99 = Column(Float)
+        maximum = Column(Float)
+        sample_count = Column(Integer, default=0, nullable=False)
+
+        source = Column(String(48))                   # open_meteo_archive|cpcb|...
+        window_start = Column(UTCDateTime)
+        window_end = Column(UTCDateTime)
+        computed_at = Column(UTCDateTime, default=utcnow, nullable=False)
+
+        def __repr__(self):
+            return "<TwinBaseline %s m%s p95=%s>" % (self.metric, self.month, self.p95)
+
+    class _TwinFlag(Model):
+        """One candidate event the agent raised for an analyst to act on.
+
+        The agent writes these; it never writes to the map. ``status`` is the
+        human gate: nothing reaches the public alerting path until an analyst
+        moves a flag out of ``pending``, which mirrors the host app's existing
+        ``verification_status == 'approved'`` rule for citizen reports.
+        """
+
+        __tablename__ = "twin_flag"
+        __table_args__ = (
+            Index("ix_twin_flag_city_status", "city_id", "status"),
+            Index("ix_twin_flag_created", "created_at"),
+        )
+
+        id = Column(Integer, primary_key=True)
+        cluster_key = Column(String(128), nullable=False, index=True)
+        city_id = Column(Integer, ForeignKey("twin_city.id"), nullable=False, index=True)
+
+        hazard_type = Column(String(48))       # flood|rain|heat|air_quality|quake|other
+        title = Column(String(255))
+        headline_h3 = Column(String(20))       # representative cell, for the map pin
+        cell_count = Column(Integer, default=0, nullable=False)
+
+        risk_score = Column(Float)             # from twin/scoring.py -- never from an LLM
+        severity = Column(String(16))          # normal|watch|warning|critical
+        anomaly_sigma = Column(Float)          # how far from this area's own normal
+        confidence = Column(Float)
+
+        brief_md = Column(Text)
+        citations = Column(JSON)               # [{source, title, url, fetched_at}, ...]
+        evidence = Column(JSON)                # the raw numbers that justified it (C3)
+
+        # rules  -- deterministic path, no model key configured
+        # llm    -- an LLM wrote the extraction/brief
+        agent_mode = Column(String(16), default="rules", nullable=False)
+
+        status = Column(String(16), default="pending", nullable=False, index=True)
+        reviewed_by = Column(Integer, nullable=True)
+        reviewed_at = Column(UTCDateTime)
+        review_note = Column(Text)
+
+        created_at = Column(UTCDateTime, default=utcnow, nullable=False)
+        updated_at = Column(UTCDateTime, default=utcnow, onupdate=utcnow, nullable=False)
+        expires_at = Column(UTCDateTime)
+
+        def __repr__(self):
+            return "<TwinFlag %s %s %s>" % (self.hazard_type, self.severity, self.status)
+
+    class _TwinFlagCell(Model):
+        """The cells one flag covers -- the alert's actual footprint."""
+
+        __tablename__ = "twin_flag_cell"
+        __table_args__ = (
+            UniqueConstraint("flag_id", "h3_index", name="uq_twin_flag_cell"),
+        )
+
+        id = Column(Integer, primary_key=True)
+        flag_id = Column(Integer, ForeignKey("twin_flag.id"), nullable=False, index=True)
+        h3_index = Column(String(20), nullable=False, index=True)
+        risk_score = Column(Float)
+
+    class _TwinDispatch(Model):
+        """Audit row for an alert an analyst actually sent to the public.
+
+        Separate from the flag because one flag may be dispatched more than
+        once (an escalation, a wider radius) and because "who pressed send, at
+        what time, to how many people, with what words" is the record that has
+        to survive an enquiry.
+        """
+
+        __tablename__ = "twin_dispatch"
+        __table_args__ = (
+            Index("ix_twin_dispatch_city_time", "city_id", "sent_at"),
+        )
+
+        id = Column(Integer, primary_key=True)
+        flag_id = Column(Integer, ForeignKey("twin_flag.id"), nullable=True, index=True)
+        city_id = Column(Integer, ForeignKey("twin_city.id"), nullable=False, index=True)
+
+        sent_by = Column(Integer, nullable=True)       # host User.id
+        sent_by_username = Column(String(128))
+        channel = Column(String(32), default="in_app+whatsapp", nullable=False)
+
+        message = Column(Text)
+        radius_km = Column(Float)
+        cells = Column(JSON)                           # h3 indexes the alert covered
+
+        recipients = Column(Integer, default=0, nullable=False)
+        whatsapp_sent = Column(Integer, default=0, nullable=False)
+        whatsapp_failed = Column(Integer, default=0, nullable=False)
+
+        sent_at = Column(UTCDateTime, default=utcnow, nullable=False, index=True)
+
+        def __repr__(self):
+            return "<TwinDispatch flag=%s to=%s>" % (self.flag_id, self.recipients)
+
     TwinCity = _TwinCity
     TwinZone = _TwinZone
     TwinCell = _TwinCell
@@ -299,6 +579,13 @@ def init_models(db_):
     TwinCellHistory = _TwinCellHistory
     TwinInfrastructure = _TwinInfrastructure
     TwinDataSnapshot = _TwinDataSnapshot
+    TwinExternalAlert = _TwinExternalAlert
+    TwinAlertCell = _TwinAlertCell
+    TwinObservation = _TwinObservation
+    TwinBaseline = _TwinBaseline
+    TwinFlag = _TwinFlag
+    TwinFlagCell = _TwinFlagCell
+    TwinDispatch = _TwinDispatch
 
     _READY = True
 
@@ -317,4 +604,11 @@ def _registry():
         "TwinCellHistory": TwinCellHistory,
         "TwinInfrastructure": TwinInfrastructure,
         "TwinDataSnapshot": TwinDataSnapshot,
+        "TwinExternalAlert": TwinExternalAlert,
+        "TwinAlertCell": TwinAlertCell,
+        "TwinObservation": TwinObservation,
+        "TwinBaseline": TwinBaseline,
+        "TwinFlag": TwinFlag,
+        "TwinFlagCell": TwinFlagCell,
+        "TwinDispatch": TwinDispatch,
     }

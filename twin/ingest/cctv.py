@@ -36,6 +36,7 @@ chooses to follow, exactly like the existing Google Street View deep link.
 import logging
 import math
 
+from .. import geo
 from .base import IngestAdapter
 from .overpass import run_overpass_query
 
@@ -134,7 +135,7 @@ class CctvOsintAdapter(IngestAdapter):
             if camera is None:
                 continue
             if lat is not None and lon is not None:
-                camera["distance_m"] = _haversine_m(lat, lon, camera["lat"], camera["lon"])
+                camera["distance_m"] = geo.distance_m(lat, lon, camera["lat"], camera["lon"])
             cameras.append(camera)
 
         if lat is not None and lon is not None:
@@ -326,13 +327,3 @@ def to_feature_collection(data):
     }
 
 
-def _haversine_m(lat1, lon1, lat2, lon2):
-    if None in (lat1, lon1, lat2, lon2):
-        return None
-    radius = 6371000.0
-    p1, p2 = math.radians(lat1), math.radians(lat2)
-    d_phi = math.radians(lat2 - lat1)
-    d_lambda = math.radians(lon2 - lon1)
-    a = (math.sin(d_phi / 2) ** 2
-         + math.cos(p1) * math.cos(p2) * math.sin(d_lambda / 2) ** 2)
-    return round(2 * radius * math.asin(min(1.0, math.sqrt(a))), 1)

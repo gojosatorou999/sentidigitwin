@@ -1,4 +1,4 @@
-"""RainViewer: display-only radar overlay (see DIGITAL_TWIN_README.md section 15).
+"""RainViewer: display-only radar overlay (see SYSTEMS.md section 2).
 
 RainViewer exposes no point-value API, so it feeds no sub-score -- the
 per-cell precipitation intensity idea in the original spec was cut. This

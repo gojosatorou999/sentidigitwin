@@ -133,6 +133,10 @@
     { id: "basemap", kind: "style", defaultOn: true },
     { id: "satellite", kind: "raster", defaultOn: true },
     { id: "buildings-3d", kind: "fill-extrusion", defaultOn: true },
+    // Official alert zones sit under the risk grid: they are context an
+    // authority published, not the twin's own measurement of the ground.
+    { id: "alert-zones", kind: "fill", defaultOn: true },
+    { id: "alert-zones-outline", kind: "line", defaultOn: true },
     { id: "twin-hexes", kind: "fill-extrusion", defaultOn: true },
     { id: "zone-outline", kind: "line", defaultOn: true },
     { id: "radar", kind: "raster", defaultOn: false },
@@ -141,10 +145,20 @@
     { id: "water-drains-glow", kind: "line", defaultOn: false },
     { id: "water-drains", kind: "line", defaultOn: false },
     { id: "infrastructure", kind: "circle", defaultOn: false },
+    { id: "cctv-cone", kind: "fill", defaultOn: false, minzoom: 15 },
     { id: "cctv", kind: "circle", defaultOn: false },
     { id: "cctv-direction", kind: "symbol", defaultOn: false, minzoom: 14 },
+    { id: "cctv-streams", kind: "circle", defaultOn: true },
+    { id: "transit-stalled-halo", kind: "circle", defaultOn: false },
+    { id: "transit-vehicles", kind: "circle", defaultOn: false },
+    { id: "air-stations", kind: "circle", defaultOn: false },
+    { id: "air-station-labels", kind: "symbol", defaultOn: false, minzoom: 11 },
     { id: "incidents", kind: "circle", defaultOn: true },
     { id: "incident-labels", kind: "symbol", defaultOn: false, minzoom: 12 },
+    // Flags are the top of the stack: the whole point of one is that it is
+    // the thing an analyst should look at first.
+    { id: "flag-glow", kind: "line", defaultOn: true },
+    { id: "flag-areas", kind: "line", defaultOn: true },
   ];
 
   function twinHexesLayer(sourceId) {
@@ -450,6 +464,337 @@
     };
   }
 
+  // ------------------------------------------------------------------
+  // Camera view cones (built client-side from the /cameras payload)
+  // ------------------------------------------------------------------
+
+  /** Field of view and range per camera type.
+   *
+   * OSM almost never tags either, so these are declared *assumptions* and the
+   * legend says so. Mirrors twin/cameras.py::CAMERA_OPTICS -- if you change
+   * one, change both, or the map and the API will disagree about what a
+   * camera can see. */
+  const CAMERA_OPTICS = {
+    fixed: { fov: 60, range: 45 },
+    panning: { fov: 180, range: 60 },   // a PTZ sweeps: draw the whole envelope
+    dome: { fov: 360, range: 30 },
+    default: { fov: 60, range: 45 },
+  };
+
+  /** Forward geodesic point. Accurate to well under a metre at these ranges. */
+  function destination(lat, lon, bearingDeg, distanceM) {
+    const R = 6371000;
+    const d = distanceM / R;
+    const br = (bearingDeg * Math.PI) / 180;
+    const p1 = (lat * Math.PI) / 180;
+    const l1 = (lon * Math.PI) / 180;
+    const p2 = Math.asin(Math.sin(p1) * Math.cos(d) + Math.cos(p1) * Math.sin(d) * Math.cos(br));
+    const l2 = l1 + Math.atan2(Math.sin(br) * Math.sin(d) * Math.cos(p1),
+                               Math.cos(d) - Math.sin(p1) * Math.sin(p2));
+    return [(l2 * 180) / Math.PI, (p2 * 180) / Math.PI];
+  }
+
+  /** A wedge polygon for one camera, or null when it cannot be drawn.
+   *
+   * Null in two cases, both deliberate: a camera with no mapped bearing (the
+   * majority) must render as a plain dot rather than a north-facing cone that
+   * claims knowledge nobody has, and a 360-degree dome has no direction to
+   * draw. */
+  function viewCone(camera) {
+    if (camera.direction === null || camera.direction === undefined) return null;
+    const optics = CAMERA_OPTICS[camera.camera_type] || CAMERA_OPTICS.default;
+    if (optics.fov >= 360) return null;
+
+    const start = camera.direction - optics.fov / 2;
+    const ring = [[camera.lon, camera.lat]];
+    for (let i = 0; i <= 12; i++) {
+      ring.push(destination(camera.lat, camera.lon, start + (optics.fov * i) / 12, optics.range));
+    }
+    ring.push([camera.lon, camera.lat]);
+    return {
+      type: "Feature",
+      geometry: { type: "Polygon", coordinates: [ring] },
+      properties: {
+        kind: camera.kind, osm_id: camera.osm_id, operator: camera.operator,
+        fov: optics.fov, range_m: optics.range, estimated: true,
+      },
+    };
+  }
+
+  /** Cones for a whole camera FeatureCollection, built in the browser.
+   *
+   * Never sent over the wire: a cone is ~14 coordinate pairs against a
+   * camera's one, and Bengaluru's camera payload is already 765 KB raw. */
+  function conesFrom(featureCollection) {
+    const features = [];
+    ((featureCollection && featureCollection.features) || []).forEach((feature) => {
+      const coords = (feature.geometry && feature.geometry.coordinates) || [];
+      if (coords.length < 2) return;
+      const cone = viewCone(Object.assign({}, feature.properties,
+                                          { lon: coords[0], lat: coords[1] }));
+      if (cone) features.push(cone);
+    });
+    return { type: "FeatureCollection", features };
+  }
+
+  function cctvConeLayer(sourceId) {
+    return {
+      id: "cctv-cone",
+      type: "fill",
+      source: sourceId,
+      // Below z15 a few thousand wedges is a solid smear that hides the city.
+      minzoom: 15,
+      layout: { visibility: "none" },
+      paint: {
+        "fill-color": cctvColourExpression(),
+        "fill-opacity": 0.18,
+        "fill-outline-color": "rgba(56,189,248,0.55)",
+      },
+    };
+  }
+
+  // ------------------------------------------------------------------
+  // Operator-supplied live camera streams (twin/cameras.py)
+  // ------------------------------------------------------------------
+
+  /** Deliberately a different shape and colour from the OSINT dots: one is a
+   * camera somebody mapped, the other is a camera you can actually watch. */
+  function cctvStreamLayer(sourceId) {
+    return {
+      id: "cctv-streams",
+      type: "circle",
+      source: sourceId,
+      paint: {
+        "circle-radius": ["interpolate", ["linear"], ["zoom"], 10, 5, 14, 8, 17, 12],
+        "circle-color": "#f43f5e",
+        "circle-stroke-width": 2.5,
+        "circle-stroke-color": "#fff1f2",
+        "circle-opacity": 0.95,
+      },
+    };
+  }
+
+  // ------------------------------------------------------------------
+  // Official alert zones (twin/alerts.py -> /api/twin/<city>/alerts)
+  // ------------------------------------------------------------------
+
+  /** CAP severity, not risk score. An alert is an authority's statement, so
+   * it keeps the authority's own vocabulary rather than being folded into the
+   * twin's bands -- an operator must be able to see "IMD said Severe". */
+  const CAP_SEVERITY_COLOUR = {
+    Extreme: "#dc2626",
+    Severe: "#ea580c",
+    Moderate: "#d97706",
+    Minor: "#0891b2",
+    Unknown: "#64748b",
+  };
+
+  function alertColourExpression() {
+    return [
+      "match", ["coalesce", ["get", "severity"], "Unknown"],
+      "Extreme", CAP_SEVERITY_COLOUR.Extreme,
+      "Severe", CAP_SEVERITY_COLOUR.Severe,
+      "Moderate", CAP_SEVERITY_COLOUR.Moderate,
+      "Minor", CAP_SEVERITY_COLOUR.Minor,
+      CAP_SEVERITY_COLOUR.Unknown,
+    ];
+  }
+
+  function alertZoneLayer(sourceId) {
+    return {
+      id: "alert-zones",
+      type: "fill",
+      source: sourceId,
+      paint: {
+        // Kept low: this sits *under* the risk grid and must never be the
+        // reason a critical cell is hard to read.
+        "fill-color": alertColourExpression(),
+        "fill-opacity": 0.14,
+      },
+    };
+  }
+
+  function alertZoneOutlineLayer(sourceId) {
+    return {
+      id: "alert-zones-outline",
+      type: "line",
+      source: sourceId,
+      paint: {
+        "line-color": alertColourExpression(),
+        "line-width": 2,
+        "line-opacity": 0.85,
+        // Dashed for a reason: a published CAP polygon is an authority's
+        // stated area, not a measured one, and the dashes keep it visually
+        // distinct from the twin's own solid geometry.
+        "line-dasharray": [3, 1.5],
+      },
+    };
+  }
+
+  // ------------------------------------------------------------------
+  // Live pollution stations (twin/live.py -> /live/air)
+  // ------------------------------------------------------------------
+
+  /** CPCB national AQI bands. These are the colours Indian officials, press
+   * and the public already read, so the map uses them rather than inventing
+   * a ramp. */
+  const AQI_BANDS = [
+    [50, "#22c55e"],    // Good
+    [100, "#a3e635"],   // Satisfactory
+    [200, "#facc15"],   // Moderate
+    [300, "#fb923c"],   // Poor
+    [400, "#ef4444"],   // Very Poor
+    [10000, "#7f1d1d"], // Severe
+  ];
+
+  function aqiColourExpression() {
+    const expression = ["step", ["coalesce", ["get", "value"], -1], "#475569"];
+    AQI_BANDS.forEach(([ceiling, colour], index) => {
+      // The first stop is the "no reading" colour above; each band starts
+      // where the previous one ended.
+      const floor = index === 0 ? 0 : AQI_BANDS[index - 1][0];
+      expression.push(floor, colour);
+    });
+    return expression;
+  }
+
+  function airStationLayer(sourceId) {
+    return {
+      id: "air-stations",
+      type: "circle",
+      source: sourceId,
+      layout: { visibility: "none" },
+      paint: {
+        "circle-radius": ["interpolate", ["linear"], ["zoom"], 9, 5, 13, 9, 16, 14],
+        "circle-color": aqiColourExpression(),
+        "circle-stroke-width": 2,
+        // A stale station is outlined, not hidden: an instrument that stopped
+        // reporting is itself information, and silently dropping it would let
+        // an operator read a gap as clean air.
+        "circle-stroke-color": [
+          "case", ["==", ["get", "status"], "stale"], "#f59e0b", "rgba(2,6,16,0.75)",
+        ],
+        "circle-opacity": ["case", ["==", ["get", "status"], "stale"], 0.55, 0.92],
+      },
+    };
+  }
+
+  function airStationLabelLayer(sourceId) {
+    return {
+      id: "air-station-labels",
+      type: "symbol",
+      source: sourceId,
+      minzoom: 11,
+      layout: {
+        "text-field": ["to-string", ["coalesce", ["get", "value"], "--"]],
+        "text-size": 11,
+        "text-font": ["Noto Sans Bold"],
+        "text-allow-overlap": false,
+        "visibility": "none",
+      },
+      paint: {
+        "text-color": "#f8fafc",
+        "text-halo-color": "rgba(2,6,16,0.9)",
+        "text-halo-width": 1.4,
+      },
+    };
+  }
+
+  // ------------------------------------------------------------------
+  // Live transit vehicles (twin/live.py -> /live/transit)
+  // ------------------------------------------------------------------
+
+  /** Stalled vehicles are the signal; moving ones are the control group.
+   *
+   * A bus fleet is the densest live road-usability sensor a city has, so the
+   * layer is coloured by whether each vehicle is moving rather than by route:
+   * twenty red dots on one arterial while the rest of the city runs green is
+   * a flooded underpass, and that pattern must be legible at a glance. */
+  function transitColourExpression() {
+    return [
+      "case",
+      ["==", ["get", "status"], "stale"], "#ef4444",
+      ["<=", ["coalesce", ["get", "value"], 0], 2], "#f97316",
+      ["<=", ["coalesce", ["get", "value"], 0], 10], "#facc15",
+      "#38bdf8",
+    ];
+  }
+
+  function transitVehicleLayer(sourceId) {
+    return {
+      id: "transit-vehicles",
+      type: "circle",
+      source: sourceId,
+      layout: { visibility: "none" },
+      paint: {
+        "circle-radius": ["interpolate", ["linear"], ["zoom"], 9, 2.5, 13, 4.5, 16, 7],
+        "circle-color": transitColourExpression(),
+        "circle-stroke-width": 0.8,
+        "circle-stroke-color": "rgba(2,6,16,0.8)",
+        "circle-opacity": 0.9,
+      },
+    };
+  }
+
+  /** A halo under stopped vehicles only, so a cluster of them reads as a
+   * bright patch at city zoom without every moving bus adding glare. */
+  function transitStalledHaloLayer(sourceId) {
+    return {
+      id: "transit-stalled-halo",
+      type: "circle",
+      source: sourceId,
+      layout: { visibility: "none" },
+      filter: ["any",
+        ["==", ["get", "status"], "stale"],
+        ["<=", ["coalesce", ["get", "value"], 99], 2]],
+      paint: {
+        "circle-radius": ["interpolate", ["linear"], ["zoom"], 9, 7, 13, 12, 16, 18],
+        "circle-color": "#f97316",
+        "circle-opacity": 0.22,
+        "circle-blur": 0.8,
+      },
+    };
+  }
+
+  // ------------------------------------------------------------------
+  // Agent flags (twin/agent -> /api/twin/<city>/flags)
+  // ------------------------------------------------------------------
+
+  /** What the agent raised, awaiting an analyst.
+   *
+   * Drawn as an outline rather than a fill so it reads as an annotation on
+   * the city rather than as another measurement of it -- and so the risk
+   * grid, which is the measured thing, stays visible underneath. */
+  function flagAreaLayer(sourceId) {
+    return {
+      id: "flag-areas",
+      type: "line",
+      source: sourceId,
+      paint: {
+        "line-color": [
+          "case", ["==", ["get", "status"], "approved"], "#22d3ee", "#e879f9",
+        ],
+        "line-width": 2.5,
+        "line-opacity": 0.9,
+      },
+    };
+  }
+
+  function flagGlowLayer(sourceId) {
+    return {
+      id: "flag-glow",
+      type: "line",
+      source: sourceId,
+      paint: {
+        "line-color": "#e879f9",
+        "line-width": 10,
+        "line-blur": 8,
+        "line-opacity": 0.28,
+      },
+      metadata: { twinPulse: "line-opacity" },
+    };
+  }
+
   function buildings3dLayer() {
     // Coalescing height fallback (section 15 risk: sparse OSM render_height
     // in Indian cities): render_height -> building:levels*3 -> 8m default.
@@ -540,8 +885,14 @@
     PRIORITY_COLOURS,
     ASSET_ICON_COLOUR,
     CCTV_KIND_COLOUR,
+    CAMERA_OPTICS,
+    CAP_SEVERITY_COLOUR,
+    AQI_BANDS,
     BASEMAP_RASTERS,
     RASTER_OPACITY,
+    destination,
+    viewCone,
+    conesFrom,
     riskColourExpression,
     hexToRgba,
     riskHeightExpression,
@@ -559,6 +910,16 @@
     waterDrainsGlowLayer,
     cctvLayer,
     cctvDirectionLayer,
+    cctvConeLayer,
+    cctvStreamLayer,
+    alertZoneLayer,
+    alertZoneOutlineLayer,
+    airStationLayer,
+    airStationLabelLayer,
+    transitVehicleLayer,
+    transitStalledHaloLayer,
+    flagAreaLayer,
+    flagGlowLayer,
     buildings3dLayer,
   };
 })(window);

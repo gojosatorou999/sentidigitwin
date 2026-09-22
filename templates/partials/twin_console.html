@@ -76,13 +76,67 @@
               title="Recompute city state now" aria-label="Recompute city state">
         <i class="fas fa-rotate"></i>
       </button>
+      {# "Which cameras actually work?" is a question the drawer's per-cell
+         panel cannot answer, because it only ever shows one cell's ground.
+         This probes every registered authority and reports it in one list. #}
+      <button type="button" class="twin-icon-btn" data-twin-coverage
+              title="Live camera coverage: which authorities are up, and where"
+              aria-label="Camera coverage">
+        <i class="fas fa-video"></i>
+      </button>
     </div>
 
     <div class="twin-header-cluster twin-header-cluster--end">
+      {# The agent's queue. Badged rather than auto-opened: a flag is a
+         request for an analyst's judgement, not an interruption. #}
+      <button type="button" class="twin-icon-btn twin-flags-btn" data-twin-flags-toggle
+              title="Areas the agent has flagged for review" aria-label="Flagged areas">
+        <i class="fas fa-flag"></i>
+        <span class="twin-flag-badge" data-twin-flag-badge></span>
+      </button>
       <div class="twin-health-pill" data-twin-health title="Live source health">
         <span class="twin-header-label">Health</span>
       </div>
       <span class="twin-clock" data-twin-clock>--:--:--</span>
+    </div>
+  </div>
+
+  {# ---- Agent flag queue: what the AI raised, awaiting a human ---- #}
+  {# Camera coverage. Deliberately a panel rather than a drawer section: it
+     is about the whole registry, not the open cell. #}
+  <div class="twin-flags-panel twin-coverage-panel" data-twin-coverage-panel>
+    <div class="twin-flags-head">
+      <span class="title"><i class="fas fa-video"></i> Live camera coverage</span>
+      <button type="button" class="twin-drawer-close" data-twin-coverage-close
+              aria-label="Close">&times;</button>
+    </div>
+    <div class="twin-flags-list" data-twin-coverage-list></div>
+  </div>
+
+  <div class="twin-flags-panel" data-twin-flags-panel>
+    <div class="twin-flags-head">
+      <span class="title"><i class="fas fa-flag"></i> Flagged areas</span>
+      <span class="twin-muted">Raised automatically · nothing is sent without you</span>
+      <button type="button" class="twin-drawer-close" data-twin-flags-close
+              aria-label="Close">&times;</button>
+    </div>
+    <div class="twin-flags-list" data-twin-flags-list></div>
+  </div>
+
+  {# ---- Live camera player: operator-supplied feeds only ---- #}
+  <div class="twin-stream-modal" data-twin-stream-modal>
+    <div class="twin-stream-box">
+      <div class="twin-stream-head">
+        <span class="title" data-twin-stream-title>Live camera</span>
+        <button type="button" class="twin-drawer-close" data-twin-stream-close
+                aria-label="Close">&times;</button>
+      </div>
+      <div class="twin-stream-body" data-twin-stream-body></div>
+      <div class="twin-stream-foot">
+        <span data-twin-stream-attrib></span>
+        <span class="twin-muted">Played directly from the operator's server &mdash;
+          Sentinel never proxies or stores this feed.</span>
+      </div>
     </div>
   </div>
 
@@ -134,6 +188,23 @@
         </div>
         <div class="twin-cctv-list" data-twin-cctv-list>
           <span class="twin-muted">&mdash;</span>
+        </div>
+
+        {# Live feeds, as distinct from mapped camera *positions* above.
+           Two sources: the operator's own stream file, and public road
+           authorities that publish a keyless catalog for this ground
+           (twin/ingest/cctv_live.py). The block always renders, even with
+           nothing to show, because "no authority covers this city" and "the
+           layer is broken" must not look the same to an operator. #}
+        <div class="twin-cctv-live" data-twin-live-cams>
+          <div class="twin-cctv-head">
+            <span class="title"><i class="fas fa-satellite-dish"></i> Live feeds
+              <span class="twin-cctv-source" data-twin-live-source>&mdash;</span></span>
+            <span class="twin-muted" data-twin-live-count></span>
+          </div>
+          <div class="twin-cctv-live-body" data-twin-live-body>
+            <span class="twin-muted">&mdash;</span>
+          </div>
         </div>
       </div>
 

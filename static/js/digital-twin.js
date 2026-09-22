@@ -192,10 +192,20 @@
       this.addSourceSafe("twin-infra-src", { type: "geojson", data: this._emptyFC });
       this.addSourceSafe("twin-drains-src", { type: "geojson", data: this._emptyFC });
       this.addSourceSafe("twin-cctv-src", { type: "geojson", data: this._emptyFC });
+      this.addSourceSafe("twin-cctv-cones-src", { type: "geojson", data: this._emptyFC });
+      this.addSourceSafe("twin-cctv-streams-src", { type: "geojson", data: this._emptyFC });
+      this.addSourceSafe("twin-alerts-src", { type: "geojson", data: this._emptyFC });
+      this.addSourceSafe("twin-air-src", { type: "geojson", data: this._emptyFC });
+      this.addSourceSafe("twin-transit-src", { type: "geojson", data: this._emptyFC });
+      this.addSourceSafe("twin-flags-src", { type: "geojson", data: this._emptyFC });
 
       // Layer 3 (section 8.4): must render BELOW twin-hexes (layer 4), so
       // risk hexagons are never occluded by a tall building extrusion.
       this.addLayerSafe(L.buildings3dLayer());
+      // Official alert zones go under the risk grid -- an authority's stated
+      // area is context for the twin's measurement, not a replacement for it.
+      this.addLayerSafe(L.alertZoneLayer("twin-alerts-src"));
+      this.addLayerSafe(L.alertZoneOutlineLayer("twin-alerts-src"));
       this.addLayerSafe(L.twinHexesLayer("twin-hexes-src"));
       this.addLayerSafe(L.twinHexOutlineLayer("twin-hexes-src"));
       this.addLayerSafe(L.twinHexesDegradedLayer("twin-hexes-src"));
@@ -205,10 +215,18 @@
       this.addLayerSafe(L.waterDrainsGlowLayer("twin-drains-src"));
       this.addLayerSafe(L.waterDrainsLayer("twin-drains-src"));
       this.addLayerSafe(L.infrastructureLayer("twin-infra-src"));
+      this.addLayerSafe(L.cctvConeLayer("twin-cctv-cones-src"));
       this.addLayerSafe(L.cctvLayer("twin-cctv-src"));
       this.addLayerSafe(L.cctvDirectionLayer("twin-cctv-src"));
+      this.addLayerSafe(L.transitStalledHaloLayer("twin-transit-src"));
+      this.addLayerSafe(L.transitVehicleLayer("twin-transit-src"));
+      this.addLayerSafe(L.airStationLayer("twin-air-src"));
+      this.addLayerSafe(L.airStationLabelLayer("twin-air-src"));
       this.addLayerSafe(L.incidentsLayer("twin-incidents-src"));
       this.addLayerSafe(L.incidentLabelsLayer("twin-incidents-src"));
+      this.addLayerSafe(L.cctvStreamLayer("twin-cctv-streams-src"));
+      this.addLayerSafe(L.flagGlowLayer("twin-flags-src"));
+      this.addLayerSafe(L.flagAreaLayer("twin-flags-src"));
 
       this.whenLoaded(() => {
         this.map.on("click", "twin-hexes", (e) => {
@@ -302,7 +320,22 @@
     setIncidentData(fc) { this._setData("twin-incidents-src", fc); }
     setInfrastructureData(fc) { this._setData("twin-infra-src", fc); }
     setDrainData(fc) { this._setData("twin-drains-src", fc); }
-    setCctvData(fc) { this._setData("twin-cctv-src", fc); }
+    setAlertData(fc) { this._setData("twin-alerts-src", fc); }
+    setAirData(fc) { this._setData("twin-air-src", fc); }
+    setTransitData(fc) { this._setData("twin-transit-src", fc); }
+    setFlagData(fc) { this._setData("twin-flags-src", fc); }
+    setStreamData(fc) { this._setData("twin-cctv-streams-src", fc); }
+
+    /** Cameras, plus the view cones derived from them.
+     *
+     * The cones are built here rather than fetched: a cone is ~14 coordinate
+     * pairs against a camera's one, and Bengaluru's camera payload is already
+     * 765 KB raw, so sending them would multiply the largest response the
+     * console makes by roughly fourteen for data the browser can derive. */
+    setCctvData(fc) {
+      this._setData("twin-cctv-src", fc);
+      this._setData("twin-cctv-cones-src", L.conesFrom(fc));
+    }
 
     _setData(sourceId, fc) {
       this.whenLoaded(() => {
@@ -507,6 +540,86 @@
       return this._waterPromise;
     }
 
+    /** Official alerts in force. Cheap, always on, refreshed on a timer.
+     *
+     * Unlike cameras and water this is not lazy: an IMD warning is the single
+     * most operationally important thing the console can show, and an
+     * operator should never have to know to switch it on.
+     */
+    async fetchAlerts() {
+      const payload = await fetchJsonWithRetry(`/api/twin/${this.citySlug}/alerts`,
+                                               { retries: 1 });
+      this.map.setAlertData(payload);
+      this.alertAdvisories = payload.advisories || [];
+      this.alertCount = (payload.features || []).length + this.alertAdvisories.length;
+      return payload;
+    }
+
+    /** One live point layer (air, transit, water sensors).
+     *
+     * Returns the collection so the caller can report freshness -- the whole
+     * claim of this layer is that it is current, so "how old is this" has to
+     * travel with the data rather than being assumed.
+     */
+    async fetchLive(kind) {
+      const payload = await fetchJsonWithRetry(
+        `/api/twin/${this.citySlug}/live/${kind}`, { retries: 1 });
+      if (kind === "air") this.map.setAirData(payload);
+      if (kind === "transit") this.map.setTransitData(payload);
+      this.liveMeta = this.liveMeta || {};
+      this.liveMeta[kind] = {
+        count: payload.count || 0,
+        newestAgeSeconds: payload.newest_age_seconds,
+        fetchedAt: Date.now(),
+      };
+      return payload;
+    }
+
+    /** Agent flags awaiting or past review. */
+    async fetchFlags() {
+      const payload = await fetchJsonWithRetry(
+        `/api/twin/${this.citySlug}/flags?geometry=true`, { retries: 1 });
+      this.map.setFlagData(payload.geojson || { type: "FeatureCollection", features: [] });
+      this.flags = payload.flags || [];
+      return payload;
+    }
+
+    /** Live camera feeds: the operator's own stream file, plus any public
+     * road authority that publishes a keyless catalog for this city.
+     *
+     * `streamMeta` is kept alongside the features because an empty list is a
+     * legitimate answer here and the console has to be able to explain which
+     * one it is: no authority covers this ground, or the one that does is
+     * down. Those are different facts and an operator must not have to guess
+     * between them. */
+    async fetchStreams() {
+      const payload = await fetchJsonWithRetry(
+        `/api/twin/cctv/streams?city=${this.citySlug}`, { retries: 1 });
+      // Reference feeds are deliberately excluded from the map. A pin on
+      // this city's map asserts "a camera is here", and a reference camera
+      // is in another country; the server already nulls its coordinates, and
+      // this filter is the second half of that same promise.
+      const features = (payload.streams || [])
+        .filter((stream) => !stream.reference && stream.lat != null && stream.lon != null)
+        .map((stream) => ({
+          type: "Feature",
+          geometry: { type: "Point", coordinates: [stream.lon, stream.lat] },
+          properties: stream,
+        }));
+      this.map.setStreamData({ type: "FeatureCollection", features });
+      this.streams = payload.streams || [];
+      this.streamMeta = {
+        configured: payload.configured_count || 0,
+        fromProviders: payload.provider_count || 0,
+        providers: (payload.providers || {}).considered || [],
+        status: (payload.providers || {}).status || {},
+        enabled: (payload.providers || {}).enabled !== false,
+        health: payload.status || "unknown",
+        reference: payload.reference || null,
+      };
+      return payload;
+    }
+
     async fetchSummary() {
       const params = new URLSearchParams({ zone: this.zone, horizon: String(this.horizon) });
       try {
@@ -522,8 +635,22 @@
     renderKPI(summary) {
       if (!this.kpiContainer) return;
       const s = summary.cells_by_status || {};
+
+      // Remember the "now" figures so a horizon change can be shown as a
+      // delta. Without this the horizon buttons look inert on a calm day:
+      // the numbers do move, but every cell stays inside the same status
+      // band, so the map's colours -- the only other feedback -- do not
+      // change at all and the button appears to do nothing.
+      if (this.horizon === 0) {
+        this._baseline = { avg: summary.avg_risk, max: summary.max_risk };
+      }
+      const base = this._baseline;
+      const delta = (base && this.horizon > 0)
+        ? this.formatDelta(summary.avg_risk - base.avg)
+        : "";
+
       this.kpiContainer.innerHTML = `
-        <span class="twin-kpi-stat">Avg <b>${summary.avg_risk}</b></span>
+        <span class="twin-kpi-stat">Avg <b>${summary.avg_risk}</b>${delta}</span>
         <span class="twin-kpi-stat">Max <b>${summary.max_risk}</b></span>
         <span class="twin-kpi-sep"></span>
         <span class="twin-badge twin-badge-critical" title="Critical cells">${s.critical || 0}</span>
@@ -533,6 +660,20 @@
         <span class="twin-kpi-sep"></span>
         <span class="twin-kpi-stat">Incidents 24h <b>${summary.incident_count_24h}</b></span>
       `;
+    }
+
+    /** A signed change against the "now" figure, or "" when it rounds to nil.
+     *
+     * Hidden below 0.05 rather than shown as "+0.0": a delta that reads zero
+     * is worse than no delta, because it looks like a broken calculation
+     * rather than a quiet city.
+     */
+    formatDelta(change) {
+      if (!isFinite(change) || Math.abs(change) < 0.05) return "";
+      const sign = change > 0 ? "+" : "−";
+      const tone = change > 0 ? "up" : "down";
+      return ` <em class="twin-kpi-delta ${tone}" title="vs now">${sign}${
+        Math.abs(change).toFixed(1)}</em>`;
     }
 
     renderKPIError() {
@@ -568,7 +709,8 @@
 
     async refreshAll() {
       await this._settleAll([
-        this.fetchState(), this.fetchSummary(), this.fetchIncidents(), this.fetchInfrastructure(),
+        this.fetchState(), this.fetchSummary(), this.fetchIncidents(),
+        this.fetchInfrastructure(), this.fetchStreams(),
       ]);
     }
 
@@ -596,13 +738,21 @@
       await this.fetchSummary();
     }
 
-    startStream(onIncident) {
+    startStream(onIncident, handlers) {
+      handlers = handlers || {};
       this.stream = TwinStream.connect({
         city: this.citySlug,
         onStateUpdate: (evt) => this.applyChangedCells(evt.changed_cells),
         onIncident: (evt) => { if (onIncident) onIncident(this.citySlug, evt); },
         onPollTick: () => this.refreshAll(),
         onStatusChange: (status) => this._setStreamBadge(status),
+        // A new official alert or agent flag is pushed the moment it lands
+        // rather than waiting for the layer's own poll: a three-hour IMD
+        // warning that sits unseen for a minute has lost a real part of the
+        // lead time it exists to provide.
+        onAlerts: (evt) => { if (handlers.onAlerts) handlers.onAlerts(this.citySlug, evt); },
+        onTransit: (evt) => { if (handlers.onTransit) handlers.onTransit(this.citySlug, evt); },
+        onFlags: (evt) => { if (handlers.onFlags) handlers.onFlags(this.citySlug, evt); },
       });
     }
 

@@ -22,6 +22,19 @@ def haversine_m(lat1, lon1, lat2, lon2):
     return 2 * EARTH_RADIUS_M * math.asin(min(1.0, math.sqrt(a)))
 
 
+def distance_m(lat1, lon1, lat2, lon2):
+    """Great-circle distance in metres, or None if any coordinate is missing.
+
+    The null-tolerant, rounded form the ingest adapters want. Four of them
+    had carried a byte-identical private copy of this, and a fifth had the
+    same code without the rounding -- which is how "why is this camera 12 m
+    from that one in one panel and 12.0392 in another" starts.
+    """
+    if None in (lat1, lon1, lat2, lon2):
+        return None
+    return round(haversine_m(lat1, lon1, lat2, lon2), 1)
+
+
 def idw_interpolate(target_lat, target_lon, samples, power=2, min_distance_m=25.0):
     """Inverse-distance-weighted interpolation.
 

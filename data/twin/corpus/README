@@ -1,0 +1,28 @@
+Agent corpus — drop documents here.
+===================================
+
+Anything you put in this folder becomes retrievable by the triage agent, which
+cites it by filename in its briefs. Until something lands here, briefs are
+written from live signals alone and carry no citations; that is a normal,
+handled state, not an error (see twin/agent/rag.py).
+
+What is read
+------------
+Files ending in .md, .txt or .json, at any depth below this folder.
+Everything else -- including this README, which deliberately has no extension --
+is ignored, so notes to yourself never end up quoted in an incident brief.
+
+What is worth putting here
+--------------------------
+  * Standard operating procedures for flood, fire, heat and crowd incidents
+  * Escalation matrices: who is called, at what threshold, in what order
+  * Past situation reports, so the agent can point at how a similar day went
+  * Shelter, hospital and depot registers as .json
+
+After adding or removing files
+------------------------------
+The index is cached in-process. Restart the server, or call
+twin.agent.rag.reset_index(), before the new documents are retrievable.
+The embedding model runs locally; no API key is involved.
+
+Configure the location with TWIN_RAG_CORPUS_DIR if you keep documents elsewhere.

@@ -847,6 +847,49 @@
   gap: 10px;
 }
 
+/* Live webcam embed: fills the same stage box a snapshot would. */
+.twin-live-frame {
+  width: 100%;
+  height: 100%;
+  min-height: 220px;
+  max-height: 280px;
+  border: 0;
+  display: block;
+}
+
+.twin-stage-actions { display: flex; gap: 10px; white-space: nowrap; }
+.twin-stage-actions a { color: #7dd3fc; cursor: pointer; }
+
+/* Pulsing "LIVE" badge -- only shown on genuinely live feeds. */
+.twin-live-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-weight: 700;
+  font-size: 9.5px;
+  letter-spacing: 0.05em;
+  color: #f87171;
+}
+
+.twin-live-badge i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #ef4444;
+  box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7);
+  animation: twin-live-pulse 1.6s infinite;
+}
+
+@keyframes twin-live-pulse {
+  0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.6); }
+  70% { box-shadow: 0 0 0 6px rgba(239, 68, 68, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .twin-live-badge i { animation: none; }
+}
+
 .twin-street-thumbs {
   display: flex;
   flex-direction: column;
@@ -929,6 +972,43 @@
   background: rgba(239, 68, 68, 0.12);
   border-radius: 4px;
   padding: 0 4px;
+}
+
+/* Live feeds: a camera whose current frame can actually be opened, as
+   opposed to the OSINT chips above, which are mapped positions. The green
+   left edge and the pulsing dot are the only visual difference that matters
+   to an operator scanning the panel, so they carry it. */
+.twin-cctv-live {
+  border-top: 1px solid var(--twin-border);
+  margin-top: 6px;
+}
+
+.twin-cctv-live-body {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 4px 12px 10px;
+}
+
+.twin-cctv-live-body code {
+  font-size: 10.5px;
+  background: rgba(255, 255, 255, 0.07);
+  border-radius: 3px;
+  padding: 0 3px;
+}
+
+.twin-cctv-chip.live {
+  border-left-color: #22c55e;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.twin-cctv-chip.live i { color: #22c55e; }
+
+.twin-cctv-chip.live .feed {
+  color: #4ade80;
+  border-color: rgba(34, 197, 94, 0.4);
+  background: rgba(34, 197, 94, 0.12);
 }
 
 /* Camera kinds, matching CCTV_KIND_COLOUR in twin-layers.js. */
@@ -1030,6 +1110,224 @@
 
 .twin-toast.show { opacity: 1; }
 
+/* ---- Live source strip --------------------------------------------------
+ *
+ * Sits between the map and the KPI row, and states how old each live layer's
+ * newest reading is. This is the honesty mechanism for the live-data layers:
+ * on a map, "the city is quiet" and "this feed died twenty minutes ago" look
+ * exactly the same, and only one of them means the operator can relax.
+ * ------------------------------------------------------------------------- */
+
+.twin-live-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 6px 12px;
+  background: var(--twin-chrome);
+  border-top: 1px solid var(--twin-border);
+  font-size: 11.5px;
+}
+
+.twin-live-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--twin-border);
+  background: var(--twin-panel);
+  color: var(--twin-text-dim);
+  white-space: nowrap;
+}
+
+.twin-live-item i { font-size: 10px; }
+.twin-live-item.ok { color: var(--twin-text); border-color: rgba(34, 197, 94, 0.35); }
+.twin-live-item.warn { color: #fed7aa; border-color: rgba(249, 115, 22, 0.5); }
+.twin-live-item.flag { color: #f5d0fe; border-color: rgba(232, 121, 249, 0.55); }
+.twin-live-item.error { color: #fecaca; border-color: rgba(239, 68, 68, 0.55); cursor: help; }
+
+/* ---- Agent flag queue ---------------------------------------------------- */
+
+.twin-flags-btn { position: relative; }
+
+.twin-flag-badge {
+  position: absolute;
+  top: -4px;
+  right: -4px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 999px;
+  font-size: 10px;
+  line-height: 16px;
+  font-weight: 700;
+  display: none;
+}
+
+.twin-flag-badge.has-flags {
+  display: block;
+  background: #e879f9;
+  color: #2a0b31;
+}
+
+.twin-icon-btn.alerting { border-color: rgba(232, 121, 249, 0.7); }
+
+.twin-flags-panel {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: min(440px, 100%);
+  z-index: 70;
+  background: rgba(11, 18, 32, 0.98);
+  border-left: 1px solid var(--twin-border-strong);
+  display: flex;
+  flex-direction: column;
+  transform: translateX(102%);
+  transition: transform 0.28s ease;
+}
+
+.twin-flags-panel.open { transform: translateX(0); }
+
+.twin-flags-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--twin-border);
+}
+
+.twin-flags-head .title { font-weight: 700; font-size: 13.5px; }
+.twin-flags-head .twin-drawer-close { margin-left: auto; position: static; }
+
+.twin-flags-list {
+  flex: 1;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.twin-flag-empty {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 18px;
+  border: 1px dashed var(--twin-border);
+  border-radius: 10px;
+  color: var(--twin-text-dim);
+  font-size: 12.5px;
+}
+
+.twin-flag-card {
+  border: 1px solid var(--twin-border);
+  border-left: 3px solid var(--twin-watch);
+  border-radius: 10px;
+  background: var(--twin-panel-solid);
+  padding: 11px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.twin-flag-card.warning { border-left-color: var(--twin-warning); }
+.twin-flag-card.critical { border-left-color: var(--twin-critical); }
+.twin-flag-card.normal { border-left-color: var(--twin-normal); }
+
+.twin-flag-card header { display: flex; align-items: center; gap: 8px; }
+
+.twin-flag-sev {
+  text-transform: uppercase;
+  font-size: 9.5px;
+  letter-spacing: 0.06em;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.twin-flag-title { font-weight: 700; font-size: 13px; flex: 1; }
+.twin-flag-score { font-variant-numeric: tabular-nums; font-weight: 700; }
+.twin-flag-meta { font-size: 11px; color: var(--twin-text-dim); }
+.twin-flag-brief { font-size: 12.5px; line-height: 1.5; white-space: pre-wrap; }
+
+.twin-flag-cites { display: flex; flex-wrap: wrap; gap: 6px; }
+
+.twin-flag-cites a {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--twin-border);
+  color: var(--twin-accent);
+  text-decoration: none;
+}
+
+.twin-flag-card footer { display: flex; flex-wrap: wrap; gap: 6px; }
+.twin-flag-reviewed { font-size: 11px; color: var(--twin-text-dim); align-self: center; }
+
+/* ---- Live camera player -------------------------------------------------- */
+
+.twin-stream-modal {
+  position: absolute;
+  inset: 0;
+  z-index: 90;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: rgba(2, 6, 16, 0.82);
+  padding: 20px;
+}
+
+.twin-stream-modal.open { display: flex; }
+
+.twin-stream-box {
+  width: min(880px, 100%);
+  background: var(--twin-panel-solid);
+  border: 1px solid var(--twin-border-strong);
+  border-radius: 12px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.twin-stream-head {
+  display: flex;
+  align-items: center;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--twin-border);
+}
+
+.twin-stream-head .title { font-weight: 700; font-size: 13.5px; }
+.twin-stream-head .twin-drawer-close { margin-left: auto; position: static; }
+
+.twin-stream-body {
+  background: #000;
+  min-height: 280px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.twin-stream-body video,
+.twin-stream-body img,
+.twin-stream-body iframe {
+  width: 100%;
+  max-height: 60vh;
+  border: 0;
+  display: block;
+}
+
+.twin-stream-foot {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: space-between;
+  padding: 8px 14px;
+  font-size: 11px;
+  color: var(--twin-text-dim);
+}
+
 /* ---- Responsive --------------------------------------------------------- */
 
 @media (max-width: 1200px) {
@@ -1051,3 +1349,108 @@
   .twin-street-thumb { width: 96px; }
   .twin-header-cluster--end { margin-left: 0; }
 }
+
+/* Reference feed -- live cameras from an authority that does not serve this
+   city, shown only when none does. Styled to read as an advisory rather than
+   as part of the list: amber rather than the accent colour, and a chip whose
+   left border no longer matches a local feed's. The label is never the only
+   thing carrying this (the server flags each stream and drops its position),
+   but it is what an operator actually sees, so it stays loud. */
+.twin-cctv-reference {
+  display: block;
+  border: 1px solid rgba(245, 158, 11, 0.45);
+  border-left: 3px solid #f59e0b;
+  background: rgba(245, 158, 11, 0.1);
+  border-radius: 7px;
+  padding: 7px 9px;
+  margin-bottom: 8px;
+}
+
+.twin-cctv-reference b {
+  display: block;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #fbbf24;
+  margin-bottom: 3px;
+}
+
+.twin-cctv-reference b i { margin-right: 5px; }
+
+.twin-cctv-reference span {
+  display: block;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--twin-text-dim);
+}
+
+.twin-cctv-chip.reference { border-left-color: #f59e0b; }
+.twin-cctv-chip.reference .feed {
+  color: #fbbf24;
+  border-color: rgba(245, 158, 11, 0.4);
+  background: rgba(245, 158, 11, 0.12);
+}
+
+/* Camera coverage panel -- the whole registry, probed live. Wider than the
+   flag queue because it is a table, and the columns are what make it
+   readable at a glance. */
+.twin-coverage-panel { width: min(760px, 94vw); }
+
+.twin-coverage-summary {
+  font-size: 12.5px;
+  color: var(--twin-text);
+  padding: 6px 0 10px;
+  border-bottom: 1px solid var(--twin-border);
+  margin-bottom: 10px;
+}
+
+.twin-coverage-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.twin-coverage-table th {
+  text-align: left;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--twin-text-dim);
+  padding: 4px 8px 6px 0;
+  border-bottom: 1px solid var(--twin-border);
+}
+
+.twin-coverage-table td {
+  padding: 6px 8px 6px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  color: var(--twin-text);
+  vertical-align: top;
+}
+
+.twin-coverage-table td.num { text-align: right; font-variant-numeric: tabular-nums; }
+.twin-coverage-table td.ok { color: #4ade80; }
+.twin-coverage-table td.bad { color: #f87171; }
+
+.twin-coverage-tag {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #fbbf24;
+  border: 1px solid rgba(245, 158, 11, 0.4);
+  background: rgba(245, 158, 11, 0.12);
+  border-radius: 4px;
+  padding: 0 4px;
+}
+
+/* Horizon delta against "now". Small and quiet: it qualifies the number it
+   sits beside rather than competing with it. */
+.twin-kpi-delta {
+  font-style: normal;
+  font-size: 10px;
+  font-weight: 700;
+  margin-left: 3px;
+  padding: 0 3px;
+  border-radius: 3px;
+}
+.twin-kpi-delta.up { color: #fca5a5; background: rgba(239, 68, 68, 0.15); }
+.twin-kpi-delta.down { color: #86efac; background: rgba(34, 197, 94, 0.15); }

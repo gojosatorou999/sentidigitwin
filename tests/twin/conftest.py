@@ -15,6 +15,16 @@ def app(tmp_path, monkeypatch):
     from twin import config as twin_config
     monkeypatch.setattr(twin_config, "CACHE_DIR", str(tmp_path / "twin-cache"))
 
+    # Off by default for the same reason the cache is redirected above: the
+    # reference feed's whole job is to fetch a *foreign* authority's catalog
+    # when the local one is empty, and every test city here is one with no
+    # local coverage. Left on, it turns much of this suite into a live
+    # network call against Hong Kong's Transport Department -- which it did,
+    # for two tests, before this line existed. The tests that exercise it
+    # (tests/twin/test_cctv_reference.py) opt back in with a stubbed
+    # provider, so the behaviour is still covered without the network.
+    monkeypatch.setattr(twin_config, "CCTV_REFERENCE_ENABLED", False)
+
     application = create_app(
         database_uri="sqlite:///" + str(tmp_path / "test_twin.db"))
     application.config.update(TESTING=True)

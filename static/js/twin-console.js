@@ -56,8 +56,17 @@
     {
       label: "Live overlays",
       items: [
+        { id: "alerts", label: "Official alert zones", checked: true, kind: "live" },
+        { id: "air", label: "Pollution stations", checked: false, kind: "live" },
+        { id: "transit", label: "Live transit", checked: false, kind: "live" },
         { id: "radar", label: "Rain radar", checked: false },
         { id: "traffic", label: "Traffic", checked: false },
+      ],
+    },
+    {
+      label: "Agent",
+      items: [
+        { id: "flags", label: "Flagged areas", checked: true, kind: "live" },
       ],
     },
   ];
@@ -67,9 +76,39 @@
   //: Toggles that own several layers and fetch their data on first use.
   const LAZY_LAYERS = new Set(["cctv", "water"]);
   const LAZY_LAYER_IDS = {
-    cctv: ["cctv", "cctv-direction"],
+    cctv: ["cctv", "cctv-direction", "cctv-cone"],
     water: ["water-bodies", "water-bodies-outline",
             "water-drains-glow", "water-drains"],
+  };
+
+  /** Toggles backed by a layer that refreshes itself on a timer.
+   *
+   * Separate from LAZY_LAYERS because the lifecycle differs: a lazy layer is
+   * fetched once on first use and then sits there, while a live layer keeps
+   * pulling for as long as it is switched on. Switching one off stops its
+   * polling -- a hidden layer that keeps fetching is how an "idle" dashboard
+   * ends up making a request a second, forever.
+   */
+  const LIVE_LAYER_IDS = {
+    alerts: ["alert-zones", "alert-zones-outline"],
+    air: ["air-stations", "air-station-labels"],
+    transit: ["transit-vehicles", "transit-stalled-halo"],
+    flags: ["flag-areas", "flag-glow"],
+  };
+  const LIVE_LAYERS = new Set(Object.keys(LIVE_LAYER_IDS));
+
+  /** How often each live layer re-fetches, in milliseconds.
+   *
+   * Matched to how fast the underlying source actually changes rather than to
+   * what feels responsive: buses move continuously, CPCB stations publish
+   * hourly, and CAP alerts are issued minutes apart. Polling an hourly feed
+   * every ten seconds just burns quota to redraw identical dots.
+   */
+  const LIVE_REFRESH_MS = {
+    alerts: 60000,
+    air: 120000,
+    transit: 20000,
+    flags: 45000,
   };
 
   function el(html) {
@@ -86,6 +125,31 @@
 
   function round(value) {
     return value == null ? "–" : Math.round(value);
+  }
+
+  // Metres between two WGS84 points. Used to order a cell's live cameras
+  // nearest-first, so the panel answers "what can see this cell" rather than
+  // "what this city owns". Mirrors twin/ingest/cctv_live.py's _haversine_m.
+  function haversineM(lat1, lon1, lat2, lon2) {
+    if ([lat1, lon1, lat2, lon2].some((v) => v == null || isNaN(v))) return Infinity;
+    const R = 6371000;
+    const toRad = (d) => (d * Math.PI) / 180;
+    const dPhi = toRad(lat2 - lat1);
+    const dLambda = toRad(lon2 - lon1);
+    const a = Math.sin(dPhi / 2) ** 2 +
+      Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLambda / 2) ** 2;
+    return 2 * R * Math.asin(Math.min(1, Math.sqrt(a)));
+  }
+
+  // "3m ago" / "2h ago" from an ISO8601 instant -- how live a live feed is.
+  function relAge(iso) {
+    const then = Date.parse(iso);
+    if (isNaN(then)) return "";
+    const secs = Math.max(0, (Date.now() - then) / 1000);
+    if (secs < 90) return "just now";
+    if (secs < 5400) return Math.round(secs / 60) + "m ago";
+    if (secs < 172800) return Math.round(secs / 3600) + "h ago";
+    return Math.round(secs / 86400) + "d ago";
   }
 
   // ------------------------------------------------------------------
@@ -118,6 +182,8 @@
 
       this.wireHeader();
       this.wireDrawer();
+      this.wireFlagPanel();
+      this.wireCoveragePanel();
       this.startClock();
 
       // The partial loads MapLibre only when the host page has not already
@@ -236,6 +302,10 @@
             <div class="twin-tooltip" data-tooltip="${slug}"></div>
           </div>
 
+          <div class="twin-live-strip" data-live-strip="${slug}">
+            <span class="twin-live-item twin-muted">Live sources starting&hellip;</span>
+          </div>
+
           <div class="twin-pane-footer">
             <div class="twin-kpi" data-kpi="${slug}">
               <span class="twin-kpi-stat">Loading&hellip;</span>
@@ -261,9 +331,15 @@
       pane.map.whenLoaded(() => {
         pane.map.flyToBbox(city.bbox);
         pane.refreshAll();
-        pane.startStream((slug_) => this.onIncidentEvent(slug_));
+        pane.startStream((slug_) => this.onIncidentEvent(slug_), {
+          onAlerts: () => this.refreshLiveLayer(pane, "alerts"),
+          onTransit: () => this.refreshLiveLayer(pane, "transit"),
+          onFlags: () => this.refreshLiveLayer(pane, "flags"),
+        });
         this.wireCameraSync(pane);
         this.syncLayerPanel(pane);
+        this.startLiveLayers(pane);
+        this.wireLivePopups(pane);
         // The basemap select starts on "Satellite" -- the same Esri imagery
         // the rest of Sentinel's maps use -- so the raster has to be applied
         // once at load, not only when the operator changes the dropdown.
@@ -393,6 +469,7 @@
           if (layerId === "traffic") { this.toggleTraffic(pane, input.checked, input); return; }
           if (layerId === "cctv") { this.toggleCctv(pane, input.checked, input); return; }
           if (layerId === "water") { this.toggleWater(pane, input.checked, input); return; }
+          if (LIVE_LAYERS.has(layerId)) { this.toggleLiveLayer(pane, layerId, input.checked); return; }
 
           pane.map.setLayerVisible(layerId, input.checked);
         });
@@ -412,7 +489,8 @@
       if (!panel) return;
       panel.querySelectorAll("[data-layer-toggle]").forEach((input) => {
         const layerId = input.dataset.layerToggle;
-        if (RASTER_LAYERS.has(layerId) || LAZY_LAYERS.has(layerId)) return;
+        if (RASTER_LAYERS.has(layerId) || LAZY_LAYERS.has(layerId)
+            || LIVE_LAYERS.has(layerId)) return;
         if (layerId === "hex-3d") { pane.map.setHexExtrusion(input.checked); return; }
         if (layerId === "low-risk") { pane.map.setLowRiskVisible(input.checked); return; }
         pane.map.setLayerVisible(layerId, input.checked);
@@ -473,6 +551,198 @@
           ? pane.waterCount + " water bodies and drains in " + pane.cityMeta.display_name
           : "No water features are mapped here in OpenStreetMap yet.",
         failed: "Water layer unavailable",
+      });
+    }
+
+    // -- live layers ---------------------------------------------------
+
+    /** Start every live layer whose checkbox is ticked at boot.
+     *
+     * Alerts and flags start on: an official warning and an agent flag are
+     * the two things an operator must never have to discover a toggle for.
+     * Stations and vehicles start off, because they are dense and most
+     * sessions are not about them.
+     */
+    startLiveLayers(pane) {
+      pane.liveTimers = pane.liveTimers || {};
+      const panel = this.q('[data-layer-panel="' + pane.citySlug + '"]');
+
+      Object.keys(LIVE_LAYER_IDS).forEach((key) => {
+        const input = panel && panel.querySelector('[data-layer-toggle="' + key + '"]');
+        const on = input ? input.checked : false;
+        this.toggleLiveLayer(pane, key, on);
+      });
+    }
+
+    toggleLiveLayer(pane, key, on) {
+      (LIVE_LAYER_IDS[key] || []).forEach((id) => pane.map.setLayerVisible(id, on));
+
+      pane.liveTimers = pane.liveTimers || {};
+      if (pane.liveTimers[key]) {
+        clearInterval(pane.liveTimers[key]);
+        delete pane.liveTimers[key];
+      }
+      if (!on) {
+        this.renderLiveStrip(pane);
+        return;
+      }
+
+      this.refreshLiveLayer(pane, key);
+      // A hidden layer that keeps polling is how an idle dashboard ends up
+      // making a request a second forever, so the interval is owned by the
+      // toggle rather than by the pane.
+      pane.liveTimers[key] = setInterval(
+        () => this.refreshLiveLayer(pane, key), LIVE_REFRESH_MS[key] || 60000);
+      this.timers.push(pane.liveTimers[key]);
+    }
+
+    async refreshLiveLayer(pane, key) {
+      try {
+        if (key === "alerts") {
+          await pane.fetchAlerts();
+        } else if (key === "flags") {
+          await pane.fetchFlags();
+          this.renderFlagBadge();
+        } else {
+          await pane.fetchLive(key);
+        }
+        pane.liveErrors = Object.assign({}, pane.liveErrors, { [key]: null });
+      } catch (err) {
+        // A live layer that fails must say so in the strip rather than
+        // freezing on its last good frame: stale data presented as current is
+        // the one failure this console is built to prevent.
+        pane.liveErrors = Object.assign({}, pane.liveErrors, { [key]: err.message });
+      }
+      this.renderLiveStrip(pane);
+    }
+
+    /** The per-layer freshness strip under each map.
+     *
+     * This is the honesty mechanism for the whole live-data phase: every
+     * layer states how old its newest reading is, or why it has none. An
+     * operator can then tell the difference between "the city is quiet" and
+     * "this feed stopped twenty minutes ago", which look identical on a map.
+     */
+    renderLiveStrip(pane) {
+      const strip = this.q('[data-live-strip="' + pane.citySlug + '"]');
+      if (!strip) return;
+
+      const items = [];
+      const errors = pane.liveErrors || {};
+      const running = pane.liveTimers || {};
+
+      const age = (seconds) => {
+        if (seconds == null) return "no reading";
+        if (seconds < 90) return "just now";
+        if (seconds < 5400) return Math.round(seconds / 60) + "m old";
+        return Math.round(seconds / 3600) + "h old";
+      };
+
+      if (running.alerts) {
+        const count = pane.alertCount || 0;
+        items.push({
+          cls: count ? "warn" : "ok", icon: "fa-triangle-exclamation",
+          text: count ? count + " official alert" + (count === 1 ? "" : "s") + " in force"
+                      : "No official alerts in force",
+          error: errors.alerts,
+        });
+      }
+      ["air", "transit"].forEach((key) => {
+        if (!running[key]) return;
+        const meta = (pane.liveMeta || {})[key] || {};
+        const label = key === "air" ? "AQI stations" : "vehicles";
+        items.push({
+          cls: meta.count ? "ok" : "muted", icon: key === "air" ? "fa-wind" : "fa-bus",
+          text: meta.count
+            ? meta.count + " " + label + " · " + age(meta.newestAgeSeconds)
+            : "No live " + label + " (feed not configured)",
+          error: errors[key],
+        });
+      });
+      if (running.flags) {
+        const pending = (pane.flags || []).filter((flag) => flag.status === "pending").length;
+        items.push({
+          cls: pending ? "flag" : "muted", icon: "fa-flag",
+          text: pending ? pending + " flagged area" + (pending === 1 ? "" : "s") + " awaiting review"
+                        : "No areas flagged",
+          error: errors.flags,
+        });
+      }
+
+      if (!items.length) {
+        strip.innerHTML = '<span class="twin-live-item twin-muted">Live layers are switched off.</span>';
+        return;
+      }
+
+      strip.innerHTML = items.map((item) => {
+        const failed = !!item.error;
+        return '<span class="twin-live-item ' + (failed ? "error" : item.cls) + '"' +
+          (failed ? ' title="' + escapeHtml(item.error) + '"' : "") + '>' +
+          '<i class="fas ' + (failed ? "fa-plug-circle-xmark" : item.icon) + '"></i>' +
+          escapeHtml(failed ? "feed unreachable" : item.text) + "</span>";
+      }).join("");
+    }
+
+    /** Click handlers for the live point layers.
+     *
+     * Each of these dots is a claim about a specific instrument or vehicle,
+     * so each must be interrogable -- an unclickable dot is decoration, and
+     * decoration is what the old static imagery already was.
+     */
+    wireLivePopups(pane) {
+      const map = pane.map.map;
+
+      const popup = (lngLat, html) => {
+        if (pane._livePopup) pane._livePopup.remove();
+        pane._livePopup = new maplibregl.Popup({ offset: 12, maxWidth: "280px" })
+          .setLngLat(lngLat).setHTML(html).addTo(map);
+      };
+
+      map.on("click", "air-stations", (event) => {
+        const props = (event.features && event.features[0] || {}).properties || {};
+        let metrics = {};
+        try { metrics = JSON.parse(props.metrics || "{}"); } catch (err) { metrics = {}; }
+        const rows = Object.entries(metrics)
+          .map(([name, value]) => '<div class="twin-popup-row"><span>' +
+            escapeHtml(name.toUpperCase()) + "</span><b>" + escapeHtml(value) + "</b></div>")
+          .join("");
+        popup(event.lngLat,
+          '<div class="twin-popup"><div class="twin-popup-title">' +
+          escapeHtml(props.name || "Monitoring station") +
+          '<span class="twin-popup-kind">' + escapeHtml(props.source || "") + "</span></div>" +
+          '<div class="twin-popup-row"><span>Index</span><b>' +
+          escapeHtml(round(Number(props.value))) + " " + escapeHtml(props.unit || "") + "</b></div>" +
+          rows +
+          '<div class="twin-popup-row"><span>Measured</span><b>' +
+          escapeHtml(props.observed_at ? relAge(props.observed_at) : "unknown") + "</b></div>" +
+          (props.status === "stale"
+            ? '<div class="twin-popup-warn">This instrument has stopped reporting.</div>' : "") +
+          "</div>");
+      });
+
+      map.on("click", "transit-vehicles", (event) => {
+        const props = (event.features && event.features[0] || {}).properties || {};
+        let metrics = {};
+        try { metrics = JSON.parse(props.metrics || "{}"); } catch (err) { metrics = {}; }
+        popup(event.lngLat,
+          '<div class="twin-popup"><div class="twin-popup-title">' +
+          escapeHtml(props.name || "Vehicle") +
+          '<span class="twin-popup-kind">' + escapeHtml(metrics.route_id || "") + "</span></div>" +
+          '<div class="twin-popup-row"><span>Speed</span><b>' +
+          escapeHtml(round(Number(props.value))) + " km/h</b></div>" +
+          '<div class="twin-popup-row"><span>Reported</span><b>' +
+          escapeHtml(props.observed_at ? relAge(props.observed_at) : "unknown") + "</b></div>" +
+          "</div>");
+      });
+
+      map.on("click", "cctv-streams", (event) => {
+        const props = (event.features && event.features[0] || {}).properties || {};
+        this.openStream(props);
+      });
+
+      ["air-stations", "transit-vehicles", "cctv-streams", "flag-areas"].forEach((layer) => {
+        map.on("mouseenter", layer, () => { map.getCanvas().style.cursor = "pointer"; });
+        map.on("mouseleave", layer, () => { map.getCanvas().style.cursor = ""; });
       });
     }
 
@@ -734,7 +1004,19 @@
     }
 
     closeDrawer() {
+      this._stopLiveRefresh();
       this.drawer.classList.remove("open");
+    }
+
+    // The live-webcam snapshot poller is per-open-cell, not session-length, so
+    // it lives outside this.timers and is cleared whenever the ground-truth
+    // panel is reset, a new shot is shown, or the drawer closes -- otherwise a
+    // click-through-ten-cells session leaves ten pollers hammering Windy.
+    _stopLiveRefresh() {
+      if (this._liveRefreshTimer) {
+        clearInterval(this._liveRefreshTimer);
+        this._liveRefreshTimer = null;
+      }
     }
 
     async openDrawer(citySlug, hexProps) {
@@ -763,6 +1045,7 @@
           this.drawerCenter = { lat: data.center[0], lon: data.center[1] };
           this.loadStreetView(data.center[0], data.center[1]);
           this.loadCctv(data.center[0], data.center[1]);
+          this.loadLiveCams(citySlug);
         }
       } catch (err) {
         this.q("[data-twin-drawer-explanation]").textContent =
@@ -813,6 +1096,7 @@
     // -- street-level ground truth --------------------------------------
 
     resetStreetPanel() {
+      this._stopLiveRefresh();
       this.q("[data-twin-street-provider]").textContent = "loading…";
       this.q("[data-twin-street-provider]").classList.remove("live");
       this.q("[data-twin-street-note]").textContent = "";
@@ -879,17 +1163,73 @@
           ? '<span class="dist">' + Math.round(shot.distance_m) + "m</span>"
           : "") + "</button>").join("");
 
+      const stage = body.querySelector("[data-street-stage]");
+
+      // Caption row, shared by the snapshot and the embedded-player views so
+      // the LIVE badge, age and the mode toggle stay put when swapping between
+      // them.
+      const captionHtml = (shot, mode) => {
+        const badge = shot.live ? '<span class="twin-live-badge"><i></i>LIVE</span> ' : "";
+        const when = shot.live
+          ? (shot.last_updated ? relAge(shot.last_updated) : "")
+          : (shot.captured_at ? escapeHtml(shot.captured_at) : "");
+        const toggle = shot.player_url
+          ? '<a href="#" data-live-toggle>' +
+            (mode === "player" ? "▣ Snapshot" : "▶ Live player") + "</a>"
+          : "";
+        const source = shot.permalink
+          ? '<a href="' + escapeHtml(shot.permalink) +
+            '" target="_blank" rel="noopener" style="color:#7dd3fc">source</a>'
+          : "";
+        return '<div class="twin-street-caption"><span>' + badge +
+          escapeHtml(shot.title || shot.provider) + (when ? " · " + when : "") +
+          '</span><span class="twin-stage-actions">' + toggle + source + "</span></div>";
+      };
+
+      // A live webcam still updates at the source; re-request it in place with
+      // a cache-buster so the tile is genuinely live rather than one frozen
+      // frame. Snapshot mode is the default -- it is light and always works,
+      // where the embedded player is heavier and provider-dependent.
+      const showSnapshot = (shot) => {
+        this._stopLiveRefresh();
+        const src = shot.image_url || shot.thumb_url;
+        stage.innerHTML =
+          '<img data-live-img src="' + escapeHtml(src) + '" alt="Street-level view">' +
+          captionHtml(shot, "snapshot");
+        if (shot.live && src) {
+          this._liveRefreshTimer = setInterval(() => {
+            const img = stage.querySelector("[data-live-img]");
+            if (!img) return;
+            img.src = src + (src.indexOf("?") === -1 ? "?" : "&") + "_r=" + Date.now();
+          }, 30000);
+        }
+        wireToggle(stage, shot, "snapshot");
+      };
+
+      // The provider's own embeddable player (Windy publishes these /embed/
+      // URLs for exactly this). We embed the published player -- never proxy
+      // or scrape the underlying stream.
+      const showPlayer = (shot) => {
+        this._stopLiveRefresh();
+        stage.innerHTML =
+          '<iframe class="twin-live-frame" src="' + escapeHtml(shot.player_url) +
+          '" allowfullscreen loading="lazy" referrerpolicy="no-referrer" ' +
+          'title="Live webcam player"></iframe>' + captionHtml(shot, "player");
+        wireToggle(stage, shot, "player");
+      };
+
+      const wireToggle = (root, shot, mode) => {
+        const toggle = root.querySelector("[data-live-toggle]");
+        if (!toggle) return;
+        toggle.addEventListener("click", (event) => {
+          event.preventDefault();
+          (mode === "player" ? showSnapshot : showPlayer)(shot);
+        });
+      };
+
       const showShot = (index) => {
         const shot = shots[index];
-        body.querySelector("[data-street-stage]").innerHTML =
-          '<img src="' + escapeHtml(shot.image_url || shot.thumb_url) + '" alt="Street-level view">' +
-          '<div class="twin-street-caption"><span>' +
-          escapeHtml(shot.title || shot.provider) +
-          (shot.captured_at ? " · " + escapeHtml(shot.captured_at) : "") + "</span>" +
-          (shot.permalink
-            ? '<a href="' + escapeHtml(shot.permalink) +
-              '" target="_blank" rel="noopener" style="color:#7dd3fc">source</a>'
-            : "") + "</div>";
+        showSnapshot(shot);
         thumbs.querySelectorAll("[data-shot]").forEach((node) =>
           node.classList.toggle("active", parseInt(node.dataset.shot, 10) === index));
         note.textContent = shot.attribution || "";
@@ -953,6 +1293,140 @@
         Object.entries(data.counts_by_kind || {})
           .map(([kind, n]) => escapeHtml(kind) + " " + n).join(" · ") +
         " · © OpenStreetMap contributors (ODbL)</div>";
+    }
+
+    /** Ensure the city's feed list is loaded, then render it.
+     *
+     * The catalog is fetched at most once per pane and sits behind a
+     * 15-minute server cache, so opening cell after cell costs nothing. A
+     * failure renders as a failure rather than as "no cameras here" -- the
+     * two must stay distinguishable.
+     */
+    async loadLiveCams(citySlug) {
+      const pane = this.panes[citySlug];
+      if (!pane) return;
+
+      if (!pane.streamMeta) {
+        try {
+          await pane.fetchStreams();
+        } catch (err) {
+          const body = this.q("[data-twin-live-body]");
+          if (body) {
+            body.innerHTML = '<span class="twin-muted">Live feed lookup failed (' +
+              escapeHtml(err.message) + ").</span>";
+          }
+          return;
+        }
+      }
+      this.renderLiveCams(citySlug);
+    }
+
+    /** Live camera feeds for the open cell's city.
+     *
+     * This block always renders something. An empty camera list is a real
+     * and expected answer for Hyderabad and Bengaluru -- no road authority
+     * publishes a catalog for either -- and the one thing it must never do
+     * is look identical to a broken layer. So the empty state names the
+     * authorities that were weighed and says none covers this ground, which
+     * is a finding an operator can act on rather than a blank panel.
+     */
+    renderLiveCams(citySlug) {
+      const body = this.q("[data-twin-live-body]");
+      const count = this.q("[data-twin-live-count]");
+      const source = this.q("[data-twin-live-source]");
+      if (!body) return;
+
+      const pane = this.panes[citySlug];
+      const meta = pane && pane.streamMeta;
+      if (!meta) {
+        source.textContent = "—";
+        count.textContent = "";
+        body.innerHTML = '<span class="twin-muted">Feed status not loaded yet.</span>';
+        return;
+      }
+
+      const streams = (pane.streams || []);
+      const total = streams.length;
+      const reference = meta.reference || null;
+      count.textContent = total ? total + " live" : "";
+      source.textContent = !meta.enabled
+        ? "providers disabled"
+        : reference
+          ? "reference — not local"
+          : (meta.providers.length
+              ? meta.providers.length + " provider" + (meta.providers.length === 1 ? "" : "s")
+              : "operator file only");
+
+      if (!total) {
+        const considered = meta.providers.length
+          ? "Weighed: " + meta.providers.map((p) => escapeHtml(p.name)).join(", ") + "."
+          : "No registered road authority publishes a camera catalog covering this city.";
+        const failures = Object.entries(meta.status || {})
+          .filter(([, text]) => String(text).startsWith("failed"));
+        body.innerHTML =
+          '<span class="twin-muted">No live feed is available here. ' + considered +
+          (failures.length
+            ? " " + failures.length + " provider(s) failed this refresh."
+            : " Camera <em>positions</em> are still mapped above from OpenStreetMap.") +
+          " An operator feed can be added to <code>" +
+          escapeHtml("data/twin/cctv_streams.json") + "</code>.</span>";
+        return;
+      }
+
+      // Nearest first when the drawer knows where the cell is, so the list
+      // answers "what can see *this* cell" rather than "what exists".
+      //
+      // Reference feeds are left in catalog order and given no distance:
+      // both would be measured from a cell in this city to a camera in
+      // another country, which is a real number that means nothing. The
+      // server already spreads them across their catalog.
+      const centre = reference ? null : this.drawerCenter;
+      const ordered = centre
+        ? streams.slice().sort((a, b) =>
+            haversineM(centre.lat, centre.lon, a.lat, a.lon) -
+            haversineM(centre.lat, centre.lon, b.lat, b.lon))
+        : streams;
+
+      const banner = reference
+        ? '<div class="twin-cctv-reference" role="note">' +
+          '<b><i class="fas fa-triangle-exclamation"></i> Not local — ' +
+          escapeHtml(reference.region) + "</b>" +
+          "<span>No authority publishes a camera catalog for this city, so " +
+          "these are live feeds from " + escapeHtml(reference.name) +
+          " (" + reference.catalog_count + " cameras). They are real and " +
+          "current, but they are not this city's ground: they stay off the " +
+          "map and are not read by scoring, flags or briefs.</span></div>"
+        : "";
+
+      body.innerHTML = banner + ordered.slice(0, reference ? 12 : 8).map((stream, index) => {
+        const distance = centre && stream.lat != null
+          ? Math.round(haversineM(centre.lat, centre.lon, stream.lat, stream.lon)) + "m"
+          : "";
+        const guessed = stream.heading_confidence === "low";
+        return '<button type="button" class="twin-cctv-chip live' +
+          (stream.reference ? " reference" : "") + '" data-twin-live-open="' +
+          index + '" title="' + escapeHtml(stream.operator || stream.provider || "") +
+          (stream.reference ? " · " + escapeHtml(stream.reference_region) +
+            ", not this city" : "") +
+          (guessed ? " · bearing is a guess, not surveyed" : "") + '">' +
+          '<i class="fas fa-video"></i><span>' +
+          escapeHtml(stream.name || "Camera") + "</span>" +
+          (distance ? "<em>" + distance + "</em>" : "") +
+          '<b class="feed">' + escapeHtml(stream.type) + "</b></button>";
+      }).join("") +
+        '<div class="twin-muted" style="margin-top:6px">' +
+        (reference
+          ? "Showing " + ordered.length + " of " + reference.catalog_count + " · "
+          : (meta.configured ? meta.configured + " operator-supplied · " : "") +
+            meta.fromProviders + " from public authorities · ") +
+        escapeHtml([...new Set(ordered.map((s) => s.attribution).filter(Boolean))]
+          .join(" · ")) + "</div>";
+
+      body.querySelectorAll("[data-twin-live-open]").forEach((button) => {
+        button.addEventListener("click", () => {
+          this.openStream(ordered[Number(button.dataset.twinLiveOpen)]);
+        });
+      });
     }
 
     // -- coordination actions -------------------------------------------
@@ -1020,6 +1494,375 @@
           this.toast("Broadcast failed: " + err.message);
         }
       }
+    }
+
+    // -- agent flags ---------------------------------------------------
+
+    /** The pending-flag count in the header. */
+    renderFlagBadge() {
+      const badge = this.q("[data-twin-flag-badge]");
+      if (!badge) return;
+
+      const pending = Object.values(this.panes).reduce(
+        (total, pane) => total + (pane.flags || [])
+          .filter((flag) => flag.status === "pending").length, 0);
+
+      badge.textContent = pending ? String(pending) : "";
+      badge.classList.toggle("has-flags", pending > 0);
+      const button = this.q("[data-twin-flags-toggle]");
+      if (button) button.classList.toggle("alerting", pending > 0);
+    }
+
+    openFlagQueue() {
+      const panel = this.q("[data-twin-flags-panel]");
+      if (!panel) return;
+      panel.classList.add("open");
+      this.renderFlagQueue();
+    }
+
+    closeFlagQueue() {
+      const panel = this.q("[data-twin-flags-panel]");
+      if (panel) panel.classList.remove("open");
+    }
+
+    renderFlagQueue() {
+      const list = this.q("[data-twin-flags-list]");
+      if (!list) return;
+
+      const flags = [];
+      Object.values(this.panes).forEach((pane) => {
+        (pane.flags || []).forEach((flag) => flags.push(
+          Object.assign({ citySlug: pane.citySlug, cityName: pane.cityMeta.display_name }, flag)));
+      });
+      flags.sort((a, b) => (b.risk_score || 0) - (a.risk_score || 0));
+
+      if (!flags.length) {
+        list.innerHTML =
+          '<div class="twin-flag-empty">' +
+          "<b>Nothing flagged right now.</b>" +
+          "<span>The agent reviews live feeds on a timer and raises an area here " +
+          "only when the risk formula clears the threshold. An empty queue is " +
+          "the normal state of a calm city.</span></div>";
+        return;
+      }
+
+      list.innerHTML = flags.map((flag) => {
+        const pending = flag.status === "pending";
+        const citations = (flag.citations || []).map((citation) =>
+          '<a href="' + escapeHtml(citation.url || "#") + '" target="_blank" rel="noopener">' +
+          escapeHtml(citation.title || citation.source || "source") + "</a>").join("");
+
+        return '<article class="twin-flag-card ' + escapeHtml(flag.severity || "watch") + '"' +
+          ' data-flag-id="' + escapeHtml(flag.id) + '"' +
+          ' data-flag-city="' + escapeHtml(flag.citySlug) + '">' +
+          '<header><span class="twin-flag-sev">' + escapeHtml(flag.severity || "watch") + "</span>" +
+          '<span class="twin-flag-title">' + escapeHtml(flag.title || "Flagged area") + "</span>" +
+          '<span class="twin-flag-score">' + escapeHtml(round(flag.risk_score)) + "</span></header>" +
+          '<div class="twin-flag-meta">' +
+          escapeHtml(flag.cityName) + " · " + escapeHtml(flag.cell_count || 0) + " cells · " +
+          escapeHtml(flag.hazard_type || "hazard") +
+          (flag.agent_mode === "llm" ? " · AI brief" : " · rule-based brief") +
+          (flag.created_at ? " · " + escapeHtml(relAge(flag.created_at)) : "") + "</div>" +
+          '<div class="twin-flag-brief">' + escapeHtml(flag.brief_md || "") + "</div>" +
+          (citations ? '<div class="twin-flag-cites">' + citations + "</div>" : "") +
+          '<footer>' +
+          '<button type="button" class="twin-action-btn secondary" data-flag-action="show">' +
+          '<i class="fas fa-location-crosshairs"></i> Show on map</button>' +
+          (pending
+            ? '<button type="button" class="twin-action-btn danger" data-flag-action="dispatch">' +
+              '<i class="fas fa-tower-broadcast"></i> Alert affected people</button>' +
+              '<button type="button" class="twin-action-btn" data-flag-action="reject">' +
+              '<i class="fas fa-xmark"></i> Dismiss</button>'
+            : '<span class="twin-flag-reviewed">' + escapeHtml(flag.status) +
+              (flag.reviewed_at ? " · " + escapeHtml(relAge(flag.reviewed_at)) : "") + "</span>") +
+          "</footer></article>";
+      }).join("");
+    }
+
+    // -- camera coverage -------------------------------------------------
+
+    /** Probe every registered camera authority and show what came back.
+     *
+     * Answers the question the per-cell panel structurally cannot: "which of
+     * these feeds actually work?" The drawer only ever shows one cell's
+     * ground, so an operator looking at two Indian cities sees empty panel
+     * after empty panel with no way to tell a dead layer from an unserved
+     * one. This lists the whole registry, live.
+     *
+     * Not on any refresh path: it calls every authority in the registry,
+     * which is exactly what the coverage gate exists to avoid doing
+     * routinely. It runs when an operator asks, and not otherwise.
+     */
+    async openCoverage() {
+      const panel = this.q("[data-twin-coverage-panel]");
+      const list = this.q("[data-twin-coverage-list]");
+      if (!panel || !list) return;
+
+      panel.classList.add("open");
+      list.innerHTML = '<div class="twin-muted">Probing every registered ' +
+        "authority… this calls each one once, so it takes a moment.</div>";
+
+      let data;
+      try {
+        data = await fetchJsonWithRetry("/api/twin/cctv/coverage", { retries: 0 });
+      } catch (err) {
+        list.innerHTML = '<div class="twin-muted">Coverage probe failed (' +
+          escapeHtml(err.message) + ").</div>";
+        return;
+      }
+
+      const rows = data.providers || [];
+      list.innerHTML =
+        '<div class="twin-coverage-summary"><b>' + data.working_count + " of " +
+        data.registry_count + "</b> authorities responding · <b>" +
+        data.total_cameras.toLocaleString() + "</b> cameras reachable</div>" +
+        '<table class="twin-coverage-table"><thead><tr>' +
+        "<th>Authority</th><th>Region</th><th>Status</th>" +
+        "<th>Cameras</th><th>Serves</th></tr></thead><tbody>" +
+        rows.map((row) => {
+          const ok = row.status === "ok";
+          const covers = Object.keys(row.covers || {})
+            .filter((slug) => row.covers[slug]);
+          return "<tr>" +
+            "<td>" + escapeHtml(row.name) +
+            (row.is_reference
+              ? ' <span class="twin-coverage-tag">reference</span>'
+              : "") + "</td>" +
+            "<td>" + escapeHtml(row.region) + "</td>" +
+            '<td class="' + (ok ? "ok" : "bad") + '">' +
+              escapeHtml(ok ? "live" : row.status) + "</td>" +
+            '<td class="num">' + row.cameras.toLocaleString() + "</td>" +
+            "<td>" + (covers.length
+              ? covers.map(escapeHtml).join(", ")
+              : '<span class="twin-muted">no modelled city</span>') + "</td>" +
+            "</tr>";
+        }).join("") +
+        "</tbody></table>" +
+        '<div class="twin-muted" style="margin-top:8px">' +
+        escapeHtml(data.note) + "</div>";
+    }
+
+    closeCoverage() {
+      const panel = this.q("[data-twin-coverage-panel]");
+      if (panel) panel.classList.remove("open");
+    }
+
+    wireCoveragePanel() {
+      const button = this.q("[data-twin-coverage]");
+      if (button) {
+        button.addEventListener("click", () => {
+          const panel = this.q("[data-twin-coverage-panel]");
+          if (panel && panel.classList.contains("open")) this.closeCoverage();
+          else this.openCoverage();
+        });
+      }
+      const close = this.q("[data-twin-coverage-close]");
+      if (close) close.addEventListener("click", () => this.closeCoverage());
+    }
+
+    wireFlagPanel() {
+      const toggle = this.q("[data-twin-flags-toggle]");
+      if (toggle) toggle.addEventListener("click", () => {
+        const panel = this.q("[data-twin-flags-panel]");
+        if (panel && panel.classList.contains("open")) this.closeFlagQueue();
+        else this.openFlagQueue();
+      });
+
+      const close = this.q("[data-twin-flags-close]");
+      if (close) close.addEventListener("click", () => this.closeFlagQueue());
+
+      const list = this.q("[data-twin-flags-list]");
+      if (!list) return;
+      list.addEventListener("click", (event) => {
+        const button = event.target.closest("[data-flag-action]");
+        if (!button) return;
+        const card = button.closest("[data-flag-id]");
+        if (!card) return;
+
+        const flagId = card.dataset.flagId;
+        const citySlug = card.dataset.flagCity;
+        const action = button.dataset.flagAction;
+
+        if (action === "show") return this.showFlagOnMap(citySlug, flagId);
+        if (action === "reject") return this.reviewFlag(citySlug, flagId, "reject");
+        if (action === "dispatch") return this.confirmDispatch(citySlug, flagId, button);
+      });
+
+      const modalClose = this.q("[data-twin-stream-close]");
+      if (modalClose) modalClose.addEventListener("click", () => this.closeStream());
+    }
+
+    showFlagOnMap(citySlug, flagId) {
+      const pane = this.panes[citySlug];
+      if (!pane) return;
+      const flag = (pane.flags || []).find((f) => String(f.id) === String(flagId));
+      if (!flag || !flag.center) return;
+      pane.map.whenLoaded(() => {
+        pane.map.map.flyTo({ center: [flag.center.lon, flag.center.lat], zoom: 13.5, duration: 900 });
+      });
+    }
+
+    async reviewFlag(citySlug, flagId, decision, note) {
+      try {
+        const response = await fetch("/api/twin/flags/" + encodeURIComponent(flagId) + "/review", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ decision, note: note || "" }),
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || response.status);
+        this.toast(decision === "reject" ? "Flag dismissed." : "Flag approved.");
+        await this.refreshLiveLayer(this.panes[citySlug], "flags");
+        this.renderFlagQueue();
+      } catch (err) {
+        this.toast("Could not update the flag: " + err.message);
+      }
+    }
+
+    /** Preview who would be reached, then dispatch on confirmation.
+     *
+     * Two steps on purpose. This is the one control in the console that
+     * contacts real members of the public, and an operator is entitled to
+     * know how many people that is *before* deciding, not after.
+     */
+    async confirmDispatch(citySlug, flagId, button) {
+      button.disabled = true;
+      try {
+        const response = await fetch(
+          "/api/twin/flags/" + encodeURIComponent(flagId) + "/dispatch/preview");
+        const preview = await response.json();
+        if (!response.ok) throw new Error(preview.error || response.status);
+
+        const lines = [
+          "Alert " + preview.recipients + " people within " +
+            preview.radius_km + " km of this flagged area?",
+          preview.whatsapp_reachable + " of them have WhatsApp linked; the rest " +
+            "get an in-app notification.",
+        ];
+        if (preview.cooldown_active) {
+          lines.push("NOTE: this area was alerted " + preview.cooldown_minutes_ago +
+            " minutes ago. Sending again may cause alert fatigue.");
+        }
+        if (!preview.recipients) {
+          lines.push("Nobody is registered in range -- the alert would reach no one.");
+        }
+        if (!window.confirm(lines.join("\n\n"))) return;
+
+        const sent = await fetch("/api/twin/flags/" + encodeURIComponent(flagId) + "/dispatch", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ radius_km: preview.radius_km }),
+        });
+        const result = await sent.json();
+        if (!sent.ok) throw new Error(result.error || sent.status);
+
+        this.toast("Alert sent to " + result.recipients + " people (" +
+          result.whatsapp_sent + " via WhatsApp).");
+        await this.refreshLiveLayer(this.panes[citySlug], "flags");
+        this.renderFlagQueue();
+      } catch (err) {
+        this.toast("Dispatch failed: " + err.message);
+      } finally {
+        button.disabled = false;
+      }
+    }
+
+    // -- live camera streams -------------------------------------------
+
+    /** Play an operator-supplied camera feed.
+     *
+     * The browser fetches the stream directly from whoever publishes it. The
+     * Sentinel server never proxies, re-hosts or stores a frame of it -- that
+     * keeps the twin a map of camera infrastructure rather than an access
+     * route into it, and it is also the only version that performs.
+     *
+     * HLS needs hls.js everywhere except Safari, which plays .m3u8 natively.
+     * It is loaded from a CDN on first use only, so a console that never
+     * opens a stream never pays for it.
+     */
+    openStream(stream) {
+      const modal = this.q("[data-twin-stream-modal]");
+      const body = this.q("[data-twin-stream-body]");
+      const title = this.q("[data-twin-stream-title]");
+      if (!modal || !body) return;
+
+      // The modal is the one place a feed fills the screen with no list
+      // around it, so the "not local" label has to travel with it -- a
+      // reference frame shown full-size and unlabelled is the exact
+      // misreading this whole path is built to prevent.
+      title.textContent = (stream.reference ? "[" + stream.reference_region + "] " : "") +
+        (stream.name || "Live camera");
+      this.q("[data-twin-stream-attrib]").textContent =
+        (stream.reference
+          ? "Reference feed — not this city. " + stream.reference_region + " · "
+          : "") +
+        (stream.attribution || stream.operator || "Operator-supplied feed");
+      modal.classList.add("open");
+      body.innerHTML = '<div class="twin-street-empty">Connecting to the feed&hellip;</div>';
+
+      if (stream.type === "iframe" || stream.type === "youtube") {
+        body.innerHTML = '<iframe src="' + escapeHtml(stream.url) +
+          '" allow="autoplay; fullscreen" referrerpolicy="no-referrer"></iframe>';
+        return;
+      }
+      if (stream.type === "image" || stream.type === "mjpeg") {
+        // A snapshot camera needs a cache-buster; a video stream must not
+        // have one. Getting this backwards either freezes the image forever
+        // or restarts the video on every repaint.
+        const bust = stream.type === "image" ? "?_t=" + Date.now() : "";
+        body.innerHTML = '<img src="' + escapeHtml(stream.url + bust) +
+          '" alt="' + escapeHtml(stream.name || "camera") + '" referrerpolicy="no-referrer">';
+        if (stream.type === "image") {
+          this._streamRefresh = setInterval(() => {
+            const img = body.querySelector("img");
+            if (img) img.src = stream.url + "?_t=" + Date.now();
+          }, 5000);
+        }
+        return;
+      }
+
+      this._playHls(body, stream);
+    }
+
+    async _playHls(body, stream) {
+      body.innerHTML = '<video controls autoplay muted playsinline></video>';
+      const video = body.querySelector("video");
+
+      if (video.canPlayType("application/vnd.apple.mpegurl")) {
+        video.src = stream.url;   // Safari plays HLS natively
+        return;
+      }
+
+      try {
+        if (!global.Hls) {
+          await new Promise((resolve, reject) => {
+            const script = document.createElement("script");
+            script.src = "https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js";
+            script.onload = resolve;
+            script.onerror = () => reject(new Error("hls.js could not be loaded"));
+            document.head.appendChild(script);
+          });
+        }
+        const hls = new global.Hls({ liveDurationInfinity: true });
+        hls.loadSource(stream.url);
+        hls.attachMedia(video);
+        this._hls = hls;
+      } catch (err) {
+        body.innerHTML = '<div class="twin-street-empty">This feed could not be played (' +
+          escapeHtml(err.message) + "). <a href=\"" + escapeHtml(stream.url) +
+          '" target="_blank" rel="noopener">Open it directly</a>.</div>';
+      }
+    }
+
+    closeStream() {
+      const modal = this.q("[data-twin-stream-modal]");
+      if (modal) modal.classList.remove("open");
+      // Tear the player down rather than hiding it: a hidden <video> keeps
+      // downloading a live stream, and a hidden iframe keeps its socket open.
+      if (this._hls) { try { this._hls.destroy(); } catch (err) { /* already gone */ } this._hls = null; }
+      if (this._streamRefresh) { clearInterval(this._streamRefresh); this._streamRefresh = null; }
+      const body = this.q("[data-twin-stream-body]");
+      if (body) body.innerHTML = "";
     }
 
     severityFromStatus() {

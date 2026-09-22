@@ -23,3 +23,23 @@ h3>=4.1.0
 shapely>=2.0.3
 flask-compress>=1.14
 cachetools>=5.3.3
+
+# --- Digital Twin: live feeds ---------------------------------------------
+# GTFS-Realtime is a protobuf wire format. Without this the transit adapter
+# still loads and reports the feed as unparseable rather than crashing, so it
+# is optional in practice -- but there is no live-vehicle layer without it.
+gtfs-realtime-bindings>=1.0.0
+
+# --- Digital Twin: triage agent (twin/agent/) ------------------------------
+# All optional. With none of these installed the agent runs its deterministic
+# path: alerts are read from their structured CAP fields, events are grouped
+# spatially, and briefs come from templates (see twin/agent/llm.py).
+langgraph>=1.0.0
+langchain-openai>=1.0.0          # also speaks NVIDIA NIM and OpenRouter
+langchain-core>=1.0.0
+
+# --- Digital Twin: document retrieval (RAG) --------------------------------
+# Local and keyless by design. chromadb has no Python 3.14 wheel; FAISS does.
+# Without these, retrieval degrades to keyword matching over the same corpus.
+faiss-cpu>=1.8.0
+sentence-transformers>=3.0.0

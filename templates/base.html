@@ -35,6 +35,57 @@
         rel="stylesheet">
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
 
+    {# Site-wide CSRF. The token is published here once and attached to every
+       same-origin mutating request by the wrapper below, so the ~23 fetch
+       call sites across the app did not each have to grow a header. #}
+    <meta name="csrf-token" content="{{ csrf_token() }}">
+    <script>
+      (function () {
+        var token = document.querySelector('meta[name="csrf-token"]');
+        token = token && token.getAttribute("content");
+        if (!token || !window.fetch) return;
+
+        var SAFE = /^(GET|HEAD|OPTIONS|TRACE)$/i;
+        var nativeFetch = window.fetch.bind(window);
+
+        function sameOrigin(input) {
+          try {
+            var url = new URL(
+              typeof input === "string" ? input : input.url, location.href);
+            return url.origin === location.origin;
+          } catch (err) {
+            // A malformed URL is not something to send a token to.
+            return false;
+          }
+        }
+
+        window.fetch = function (input, init) {
+          init = init || {};
+          var method = init.method ||
+            (typeof input === "object" && input && input.method) || "GET";
+          // Never attach the token to a cross-origin request: that would leak
+          // it to whoever is being called, which is worse than not having it.
+          if (!SAFE.test(method) && sameOrigin(input)) {
+            var headers = new Headers(
+              init.headers || (typeof input === "object" && input && input.headers) || {});
+            if (!headers.has("X-CSRFToken")) headers.set("X-CSRFToken", token);
+            init = Object.assign({}, init, { headers: headers });
+          }
+          return nativeFetch(input, init);
+        };
+
+        var open = XMLHttpRequest.prototype.open;
+        var send = XMLHttpRequest.prototype.send;
+        XMLHttpRequest.prototype.open = function (method, url) {
+          this._csrfNeeded = !SAFE.test(method || "GET") && sameOrigin(url);
+          return open.apply(this, arguments);
+        };
+        XMLHttpRequest.prototype.send = function () {
+          if (this._csrfNeeded) this.setRequestHeader("X-CSRFToken", token);
+          return send.apply(this, arguments);
+        };
+      })();
+    </script>
     {% block head_extra %}{% endblock %}
 
     <!-- Enhanced Responsive Styles -->

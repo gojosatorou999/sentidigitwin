@@ -15,7 +15,8 @@
   const MAX_RECONNECT_ATTEMPTS = 3;
 
   function connect(options) {
-    const { city, zone, onStateUpdate, onIncident, onStatusChange, onPollTick } = options;
+    const { city, zone, onStateUpdate, onIncident, onStatusChange, onPollTick,
+            onAlerts, onTransit, onFlags } = options;
     let closed = false;
     let source = null;
     let reconnectAttempts = 0;
@@ -74,6 +75,21 @@
           console.warn("twin-stream: malformed incident event", err);
         }
       });
+
+      // Live-data events. Each carries only a summary (counts), never the
+      // payload itself: the pane re-fetches the layer it owns, so one SSE
+      // frame stays a few bytes whether three buses moved or three thousand.
+      [["alerts", onAlerts], ["transit", onTransit], ["flags", onFlags]]
+        .forEach(([name, handler]) => {
+          source.addEventListener(name, (evt) => {
+            try {
+              const data = JSON.parse(evt.data);
+              if (handler) handler(data);
+            } catch (err) {
+              console.warn("twin-stream: malformed " + name + " event", err);
+            }
+          });
+        });
 
       source.onopen = () => {
         stopPolling();

@@ -1,4 +1,4 @@
-"""The five sub-scores + composite (DIGITAL_TWIN_README.md section 5.1).
+"""The five sub-scores + composite risk value.
 
 Pure functions only: every function here takes already-resolved numbers (or
 None for "genuinely unmeasured, no neutral fallback exists") and returns a
@@ -187,14 +187,32 @@ def env_score(us_aqi, apparent_temp_c):
 # COMPOSITE: hazard * vulnerability (corrected section 5.1)
 # --------------------------------------------------------------------------
 
-def composite(hydro, incident, env, terrain, infra):
+def composite(hydro, incident, env, terrain, infra,
+              alert=None, disruption=None, anomaly=None):
     """Returns a dict with everything TwinCellState needs to store.
 
-    hazard   = renormalised(0.55*hydro + 0.30*incident + 0.15*env) -- what is
-               HAPPENING; 0 when hydro/incident/env are all calm.
+    hazard   = renormalised(0.55*hydro + 0.30*incident + 0.15*env
+                            + 0.35*alert + 0.12*disruption) -- what is
+               HAPPENING; 0 when every term is calm.
+    hazard  *= anomaly_multiplier(anomaly) -- 1.00 .. 1.25, see below.
     vulnerability = 1 + 0.6*(0.6*terrain + 0.4*infra)/100 -- what is AT
                STAKE; ranges 1.0..1.6 and never reduces risk.
     risk_score = clamp(0, 100, hazard * vulnerability)
+
+    `alert`, `disruption` and `anomaly` are the live-data extension and all
+    three default to None, meaning *unmeasured*. Because
+    :func:`_weighted_renormalize` drops None terms and renormalises the rest,
+    a deployment with no alert feed and no transit feed produces byte-identical
+    scores to the version before they existed. That is the property that makes
+    this extension safe to add to a running system: it cannot quietly re-tune a
+    city that has nothing new to say.
+
+    `anomaly` (0..100, how far outside this cell's own history today is) is a
+    **multiplier on hazard, not another additive term**. Being unusual is not
+    the same as being dangerous: an unusually wet hour over a low-lying,
+    drain-poor, hospital-dense cell should escalate, while the same hour on
+    high ground should barely move. Multiplying lets hazard and vulnerability
+    decide which case it is, instead of letting novelty alone raise an alarm.
 
     `degraded_inputs` merges drops from both halves so C3 stays intact: every
     number that fed the score, and every one that didn't, is visible.
@@ -203,7 +221,22 @@ def composite(hydro, incident, env, terrain, infra):
         "hydro": (hydro, config.HAZARD_WEIGHTS["hydro"]),
         "incident": (incident, config.HAZARD_WEIGHTS["incident"]),
         "env": (env, config.HAZARD_WEIGHTS["env"]),
+        "alert": (alert, config.HAZARD_WEIGHTS["alert"]),
+        "disruption": (disruption, config.HAZARD_WEIGHTS["disruption"]),
     })
+
+    # Terms that simply do not apply to this deployment are not "degraded" --
+    # reporting an absent transit feed as a degraded input on all 1,747 cells
+    # would drown the one signal `degraded_inputs` exists to carry.
+    hazard_dropped = [name for name in hazard_dropped
+                      if name not in ("alert", "disruption")]
+
+    anomaly_factor = 1.0
+    if hazard is not None and anomaly is not None:
+        from . import anomaly as anomaly_module
+
+        anomaly_factor = anomaly_module.anomaly_multiplier(anomaly)
+        hazard = min(100.0, hazard * anomaly_factor)
 
     # Vulnerability has no "all missing" failure mode worth propagating: a
     # missing terrain/infra term contributes its neutral midpoint rather than
@@ -236,5 +269,6 @@ def composite(hydro, incident, env, terrain, infra):
         "height_m": risk_score * height_factor,
         "hazard_score": hazard,
         "vulnerability_multiplier": vulnerability,
+        "anomaly_multiplier": anomaly_factor,
         "degraded_inputs": sorted(set(hazard_dropped) | set(vulnerability_dropped)),
     }

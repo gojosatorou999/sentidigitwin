@@ -120,8 +120,28 @@ class TestStatusBands:
 
 
 class TestWeights:
-    def test_hazard_weights_sum_to_one(self):
-        assert abs(sum(config.HAZARD_WEIGHTS.values()) - 1.0) < 1e-9
+    def test_core_hazard_weights_sum_to_one(self):
+        """The three always-present terms still form a complete weighting.
+
+        The live-data terms (`alert`, `disruption`) deliberately push the raw
+        total above 1.0: they are frequently absent -- no alert in force, no
+        transit feed configured -- and scoring.composite renormalises across
+        whatever is actually present. Requiring the whole dict to sum to one
+        would mean a city with no transit feed silently scoring every cell
+        lower than a city with one, for no reason on the ground.
+        """
+        core = {k: v for k, v in config.HAZARD_WEIGHTS.items()
+                if k in ("hydro", "incident", "env")}
+        assert abs(sum(core.values()) - 1.0) < 1e-9
+
+    def test_live_terms_only_ever_add_weight(self):
+        for key in ("alert", "disruption"):
+            assert config.HAZARD_WEIGHTS[key] > 0
+
+    def test_an_official_alert_outranks_a_citizen_report(self):
+        # A warning about what is coming must carry more than a report of what
+        # already happened, or the system is measuring the past.
+        assert config.HAZARD_WEIGHTS["alert"] > config.HAZARD_WEIGHTS["incident"]
 
     def test_vulnerability_weights_sum_to_one(self):
         assert abs(sum(config.VULNERABILITY_WEIGHTS.values()) - 1.0) < 1e-9

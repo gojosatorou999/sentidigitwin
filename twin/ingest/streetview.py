@@ -24,6 +24,7 @@ opens in the operator's own browser, so it costs nothing and needs no key.
 import logging
 
 from .. import config
+from .. import geo
 from .base import IngestAdapter
 
 log = logging.getLogger("twin.ingest.streetview")
@@ -72,7 +73,11 @@ class StreetViewAdapter(IngestAdapter):
     #: photo an hour from now. A long TTL keeps a demo audience clicking
     #: through twenty hexes off KartaView's rate limiter entirely.
     cache_ttl_s = 24 * 60 * 60
-    timeout_s = max(config.HTTP_TIMEOUT_S, 12.0)
+    #: Bounded low on purpose: this call sits on the drill-down's critical
+    #: path, so a slow provider must fail fast and let the panel render "no
+    #: coverage" rather than spin. KartaView answers a hit in ~2 s; anything
+    #: past 6 s is a provider stall, not a slow hit worth waiting for.
+    timeout_s = 6.0
     max_retries = 1
 
     def fetch_raw(self, lat=None, lon=None, radius_m=DEFAULT_RADIUS_M, **_):
@@ -200,47 +205,33 @@ class StreetViewAdapter(IngestAdapter):
         return ((response.json() or {}).get("result") or {}).get("data") or []
 
     def _mapillary(self, lat, lon, radius_m):
-        # Mapillary's Graph API filters by bbox, not radius. One degree of
-        # latitude is ~111 km everywhere; longitude shrinks with cos(lat),
-        # but at 13-17 deg N the error is under 4% -- irrelevant over a few
-        # hundred metres, and not worth a projection dependency.
-        import math
+        """Nearest Mapillary photos, discovered through vector tiles.
 
-        d_lat = radius_m / 111000.0
-        d_lon = radius_m / (111000.0 * max(0.1, math.cos(math.radians(lat))))
-        bbox = "%f,%f,%f,%f" % (lon - d_lon, lat - d_lat, lon + d_lon, lat + d_lat)
+        Not through ``/images?bbox=``, which the documentation points at and
+        which returns zero rows for every bbox and every city tested with a
+        valid token -- including ones with dense coverage. See
+        twin/ingest/mapillary_tiles.py for the measurements. Using it meant
+        the panel reported "no imagery" on ground that has thousands of
+        photos, which is the one failure shape worth engineering around.
+        """
+        from .mapillary_tiles import nearby_images
 
-        response = self.session.get(
-            MAPILLARY_URL,
-            params={
-                "access_token": config.MAPILLARY_TOKEN,
-                "fields": "id,thumb_1024_url,thumb_256_url,computed_geometry,captured_at,compass_angle",
-                "bbox": bbox,
-                "limit": MAX_IMAGES,
-            },
-            timeout=self.timeout_s,
-        )
-        response.raise_for_status()
-        rows = (response.json() or {}).get("data") or []
+        photos = nearby_images(self.session, config.MAPILLARY_TOKEN,
+                               lat, lon, radius_m, MAX_IMAGES, self.timeout_s)
 
-        images = []
-        for row in rows:
-            geometry = (row.get("computed_geometry") or {}).get("coordinates") or [None, None]
-            images.append({
-                "provider": "mapillary",
-                "id": row.get("id"),
-                "thumb_url": row.get("thumb_256_url") or row.get("thumb_1024_url"),
-                "image_url": row.get("thumb_1024_url"),
-                "lat": geometry[1],
-                "lon": geometry[0],
-                "captured_at": _epoch_ms_to_date(row.get("captured_at")),
-                "heading": row.get("compass_angle"),
-                "distance_m": _haversine_m(lat, lon, geometry[1], geometry[0]),
-                "attribution": "(c) Mapillary contributors (CC BY-SA)",
-                "permalink": "https://www.mapillary.com/app/?pKey=%s&focus=photo" % row.get("id"),
-            })
-        images.sort(key=lambda i: i["distance_m"] if i["distance_m"] is not None else 1e9)
-        return images
+        return [{
+            "provider": "mapillary",
+            "id": photo["id"],
+            "thumb_url": photo.get("thumb_256_url") or photo.get("thumb_1024_url"),
+            "image_url": photo.get("thumb_1024_url"),
+            "lat": photo["lat"],
+            "lon": photo["lon"],
+            "captured_at": _epoch_ms_to_date(photo.get("captured_at")),
+            "heading": photo.get("compass_angle"),
+            "distance_m": photo.get("distance_m"),
+            "attribution": "(c) Mapillary contributors (CC BY-SA)",
+            "permalink": "https://www.mapillary.com/app/?pKey=%s&focus=photo" % photo["id"],
+        } for photo in photos]
 
     def _windy(self, lat, lon, radius_m):
         radius_km = max(1, int(round(radius_m / 1000.0)) or 5)
@@ -248,7 +239,11 @@ class StreetViewAdapter(IngestAdapter):
             WINDY_WEBCAMS_URL,
             params={
                 "nearby": "%f,%f,%d" % (lat, lon, radius_km),
-                "include": "location,images,urls",
+                # ``player`` yields the public embeddable live player; ``images``
+                # yields the continuously-updated snapshot. The panel embeds the
+                # first and auto-refreshes the second -- both are what makes a
+                # webcam "live" rather than a one-off photo.
+                "include": "location,images,urls,player",
                 "limit": MAX_IMAGES,
             },
             headers={"x-windy-api-key": config.WINDY_WEBCAMS_KEY},
@@ -261,12 +256,23 @@ class StreetViewAdapter(IngestAdapter):
         for row in rows:
             location = row.get("location") or {}
             current = (row.get("images") or {}).get("current") or {}
+            player = row.get("player") or {}
+            # Windy publishes these ``/embed/player/<id>/*`` URLs specifically
+            # for iframe embedding, so surfacing one is a link the operator was
+            # meant to follow -- never a proxied or scraped stream.
+            player_url = player.get("day") or player.get("live") or player.get("month")
             webcams.append({
                 "provider": "windy",
                 "id": row.get("webcamId") or row.get("id"),
                 "title": row.get("title"),
                 "thumb_url": current.get("preview") or current.get("thumbnail"),
                 "image_url": current.get("preview"),
+                # A live embeddable player, when Windy exposes one for this cam.
+                "player_url": player_url,
+                # ISO8601; the panel shows it as the "last frame" age so an
+                # operator can judge how live "live" actually is.
+                "last_updated": row.get("lastUpdatedOn"),
+                "status": row.get("status"),
                 "lat": location.get("latitude"),
                 "lon": location.get("longitude"),
                 "live": True,
@@ -298,14 +304,3 @@ def _epoch_ms_to_date(value):
         return None
 
 
-def _haversine_m(lat1, lon1, lat2, lon2):
-    if None in (lat1, lon1, lat2, lon2):
-        return None
-    import math
-    radius = 6371000.0
-    p1, p2 = math.radians(lat1), math.radians(lat2)
-    d_phi = math.radians(lat2 - lat1)
-    d_lambda = math.radians(lon2 - lon1)
-    a = (math.sin(d_phi / 2) ** 2
-         + math.cos(p1) * math.cos(p2) * math.sin(d_lambda / 2) ** 2)
-    return 2 * radius * math.asin(min(1.0, math.sqrt(a)))

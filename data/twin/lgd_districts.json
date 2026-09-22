@@ -1,0 +1,56 @@
+{
+  "cities": {},
+  "districts": {
+    "karnataka|chamarajanagara": {
+      "agreement": 2,
+      "code": "531"
+    }
+  },
+  "note": "Inferred from SACHET CAP alerts that listed district names and LGD codes together. Verify against https://lgdirectory.gov.in before relying on a code for evacuation decisions.",
+  "rejected": {
+    "karnataka|chikkaballapura": {
+      "candidates": {
+        "542": 1,
+        "544": 1
+      },
+      "contested": true
+    },
+    "karnataka|chikkamagaluru": {
+      "candidates": {
+        "532": 1
+      },
+      "contested": false
+    },
+    "karnataka|kolar": {
+      "candidates": {
+        "542": 1,
+        "630": 1
+      },
+      "contested": true
+    },
+    "karnataka|mandya": {
+      "candidates": {
+        "630": 1
+      },
+      "contested": false
+    },
+    "karnataka|ramanagara": {
+      "candidates": {
+        "631": 1
+      },
+      "contested": false
+    },
+    "karnataka|uttara kannada": {
+      "candidates": {
+        "550": 1
+      },
+      "contested": false
+    },
+    "telangana|nagarkurnool": {
+      "candidates": {
+        "694": 1
+      },
+      "contested": false
+    }
+  }
+}
