@@ -5,7 +5,7 @@
 
 Two different failure budgets, per the spec review:
 
-- The **clip polygon** (admin_level=8) is mandatory. Phase 1's grid
+- The **clip polygon** (admin_level=8) is mandatory. Phase 1's grid 
   generation refuses to run without it (see twin/grid.py). This script exits
   non-zero if it cannot resolve one.
 - **Zone polygons** are best-effort. Real OSM coverage for GHMC's 6 named
